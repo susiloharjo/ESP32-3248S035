@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <time.h>
 
 #include <lvgl.h>
 #include <TFT_eSPI.h>
@@ -515,15 +517,29 @@ void GT911_Int()
 }
 //*****************************************************************************************************//
 
-/*更改屏幕分辨率*/
-static const uint16_t screenWidth  = 320;
-static const uint16_t screenHeight = 480;
+/*更改屏幕分辨率 - Landscape mode*/
+static const uint16_t screenWidth  = 480;
+static const uint16_t screenHeight = 320;
 
 static lv_disp_draw_buf_t draw_buf;
-static lv_color_t buf[screenWidth * screenHeight / 6];
-//static lv_color_t buf[ screenWidth * 10 ];
+static lv_color_t buf[screenWidth * 10];
 
 TFT_eSPI tft = TFT_eSPI(); /* TFT实例 */
+
+// WiFi Configuration
+const char* WIFI_SSID = "wifilab";
+const char* WIFI_PASSWORD = "pradipa.1";
+
+// NTP Configuration
+const char* NTP_SERVER = "pool.ntp.org";
+const long GMT_OFFSET = 7 * 3600; // GMT+7 (Indonesia)
+const int DAYLIGHT_OFFSET = 0;
+
+// LVGL IP Display Objects
+lv_obj_t * ip_label;
+lv_obj_t * time_label;
+lv_obj_t * date_label;
+lv_timer_t * update_timer;
 
 #if LV_USE_LOG != 0
 /* 串行调试 */
@@ -629,6 +645,185 @@ void lv_example_btn(void)
   lv_obj_center(label2);
 }
 //_______________________
+
+// WiFi Connection Function
+void connectToWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  
+  // WiFi status codes for debugging
+  const char* wifiStatusText[] = {
+    "IDLE_STATUS", "NO_SSID_AVAIL", "SCAN_COMPLETED", "CONNECTED", 
+    "CONNECT_FAILED", "CONNECTION_LOST", "DISCONNECTED"
+  };
+  
+  // Disconnect and reset WiFi
+  WiFi.disconnect(true);
+  delay(1000);
+  
+  // Set WiFi mode to Station
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  
+  // Scan for available networks first
+  Serial.println("Scanning for networks...");
+  int n = WiFi.scanNetworks();
+  Serial.print("Found ");
+  Serial.print(n);
+  Serial.println(" networks:");
+  
+  bool networkFound = false;
+  for (int i = 0; i < n; i++) {
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.print(WiFi.SSID(i));
+    Serial.print(" (");
+    Serial.print(WiFi.RSSI(i));
+    Serial.print(" dBm) ");
+    Serial.println((WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "Open" : "Encrypted");
+    
+    if (WiFi.SSID(i) == WIFI_SSID) {
+      networkFound = true;
+      Serial.print("*** Target network found! ***");
+    }
+  }
+  
+  if (!networkFound) {
+    Serial.println("ERROR: Target network 'wifilab' not found in scan!");
+    Serial.println("Please check the SSID name.");
+    return;
+  }
+  
+  // Begin connection
+  Serial.println("Starting connection...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  int attempts = 0;
+  const int maxAttempts = 20; // 20 seconds timeout
+  
+  while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
+    delay(1000);
+    attempts++;
+    int status = WiFi.status();
+    Serial.print("Attempt ");
+    Serial.print(attempts);
+    Serial.print("/");
+    Serial.print(maxAttempts);
+    Serial.print(" - WiFi status: ");
+    Serial.print(status);
+    if (status >= 0 && status <= 6) {
+      Serial.print(" (");
+      Serial.print(wifiStatusText[status]);
+      Serial.print(")");
+    }
+    Serial.println();
+    
+    // Print signal strength if available
+    if (status == WL_CONNECTED || status == WL_DISCONNECTED) {
+      Serial.print("Signal strength: ");
+      Serial.print(WiFi.RSSI());
+      Serial.println(" dBm");
+    }
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Signal strength: ");
+    Serial.print(WiFi.RSSI());
+    Serial.println(" dBm");
+  } else {
+    Serial.println("WiFi connection failed!");
+    Serial.print("Final status: ");
+    Serial.println(WiFi.status());
+    Serial.println("Possible issues:");
+    Serial.println("1. Wrong SSID or password");
+    Serial.println("2. WiFi network not available");
+    Serial.println("3. Signal too weak");
+    Serial.println("4. Network security issues");
+  }
+}
+
+// Update Display Function
+void updateDisplay(lv_timer_t * timer) {
+  if (WiFi.status() == WL_CONNECTED) {
+    // Update IP address
+    IPAddress ip = WiFi.localIP();
+    String ipString = "IP: " + ip.toString();
+    lv_label_set_text(ip_label, ipString.c_str());
+    
+    // Update time
+    time_t now = time(nullptr);
+    if (now > 0) {  // Check if time is valid
+      struct tm * timeinfo = localtime(&now);
+      
+      char timeBuffer[20];
+      sprintf(timeBuffer, "%02d:%02d:%02d", timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+      lv_label_set_text(time_label, timeBuffer);
+      
+      char dateBuffer[50];
+      const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+      sprintf(dateBuffer, "%02d-%s-%04d", timeinfo->tm_mday, months[timeinfo->tm_mon], timeinfo->tm_year + 1900);
+      lv_label_set_text(date_label, dateBuffer);
+    } else {
+      lv_label_set_text(time_label, "Syncing...");
+      lv_label_set_text(date_label, "Time Sync");
+    }
+  } else {
+    // No WiFi - show offline clock
+    static unsigned long startTime = millis();
+    unsigned long currentTime = millis();
+    unsigned long seconds = (currentTime - startTime) / 1000;
+    
+    // Simple offline clock (starts from 00:00:00)
+    int hours = (seconds / 3600) % 24;
+    int minutes = (seconds / 60) % 60;
+    int secs = seconds % 60;
+    
+    char timeBuffer[20];
+    sprintf(timeBuffer, "%02d:%02d:%02d", hours, minutes, secs);
+    lv_label_set_text(time_label, timeBuffer);
+    
+    lv_label_set_text(ip_label, "Offline Mode");
+    lv_label_set_text(date_label, "No Internet");
+  }
+}
+
+// Create IP Display UI
+void createIPDisplay() {
+  // Clear screen
+  lv_obj_clean(lv_scr_act());
+  
+  // Set white background
+  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0xFFFFFF), 0);
+  
+  // Create time label (center top) - Large bold font
+  time_label = lv_label_create(lv_scr_act());
+  lv_label_set_text(time_label, "Starting...");
+  lv_obj_set_style_text_font(time_label, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(time_label, lv_color_hex(0x000000), 0);
+  lv_obj_align(time_label, LV_ALIGN_CENTER, 0, -30);
+  
+  // Create date label (center bottom) - Smaller font
+  date_label = lv_label_create(lv_scr_act());
+  lv_label_set_text(date_label, "Loading...");
+  lv_obj_set_style_text_font(date_label, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(date_label, lv_color_hex(0x000000), 0);
+  lv_obj_align(date_label, LV_ALIGN_CENTER, 0, 20);
+  
+  // Create IP label (top right corner) - Small font
+  ip_label = lv_label_create(lv_scr_act());
+  lv_label_set_text(ip_label, "IP: Connecting...");
+  lv_obj_set_style_text_font(ip_label, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(ip_label, lv_color_hex(0x666666), 0);
+  lv_obj_align(ip_label, LV_ALIGN_TOP_RIGHT, -10, 10);
+  
+  // Create update timer
+  update_timer = lv_timer_create(updateDisplay, 1000, NULL);
+}
+
 /* 显示器刷新 */
 void my_disp_flush( lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p )
 {
@@ -750,90 +945,78 @@ uint8_t GT9147_Scan(uint8_t mode)
 {
   uint8_t buf[41];
    GT911_RD_Reg(GT911_READ_XY_REG, buf, 1); 
-   Serial.printf("GT911_READ_XY_REG:%d\r\n", buf[0]); 
+   Serial.printf("GT911_READ_XY_REG:%d\r\n", buf[0]);
+   return 0;
 }
 
 void setup()
 { 
- // int x;
-//  int y;
   Serial.begin( 115200 ); /*初始化串口*/
-//  x = touch.X();
-//  y = touch.Y();
-  String LVGL_Arduino = "Hello Arduino!9999";
-  Serial.println( LVGL_Arduino );
-  delay(100);
+  Serial.println("Starting ESP32-3248S035 IP Display...");
+  
+  // Initialize GT911 touch
   gt911_int_();
-      LVGL_Arduino += String('V') + lv_version_major() + "." + lv_version_minor() + "." + lv_version_patch();
   
-  
-      Serial.println( "I am LVGL_Arduino" );
-      //GT911_Int();
-      lv_init();
-       
+  // Initialize LVGL
+    lv_init();
 
-  
   #if LV_USE_LOG != 0
       lv_log_register_print_cb( my_print ); /* 用于调试的注册打印功能 */
   #endif
   
-      tft.begin();          /*初始化*/
-      tft.setRotation(0);    /* 旋转 */
-      tft.fillScreen(TFT_RED);
-      delay(500);
-      tft.fillScreen(TFT_GREEN);
-      delay(500);
-      tft.fillScreen(TFT_BLUE);
-      delay(500);
-      tft.fillScreen(TFT_BLACK);
-      tft.drawRect(0, 0, 320, 480, TFT_RED);
-      delay(500);
-      //校准模式。一是四角定位、二是直接输入模拟数值直接定位
-      //touch_calibrate();//屏幕校准
-      //uint16_t calData[5] = { 145, 3788, 271, 3535, 1 };
-      //uint16_t calData[5] = { 241, 3532, 171, 3685, 3  };
-      //tft.setTouch( calData );
+  // Initialize TFT
+  tft.begin();          /*初始化*/
+  tft.setRotation(1);    /* 旋转 - Landscape mode */
+  tft.fillScreen(TFT_RED);
+  delay(500);
+  tft.fillScreen(TFT_GREEN);
+  delay(500);
+  tft.fillScreen(TFT_BLUE);
+  delay(500);
+  tft.fillScreen(TFT_BLACK);
+  tft.drawRect(0, 0, 480, 320, TFT_RED);
+  delay(500);
   
-      lv_disp_draw_buf_init( &draw_buf, buf, NULL, screenWidth * screenHeight / 6 );
+  // Initialize LVGL display buffer
+  lv_disp_draw_buf_init( &draw_buf, buf, NULL, screenWidth * 10 );
   
-      /*初始化显示*/
-      static lv_disp_drv_t disp_drv;
-      lv_disp_drv_init( &disp_drv );
-      /*将以下行更改为显示分辨率*/
-      disp_drv.hor_res = screenWidth;
-      disp_drv.ver_res = screenHeight;
-      disp_drv.flush_cb = my_disp_flush;
-      disp_drv.draw_buf = &draw_buf;
-      lv_disp_drv_register( &disp_drv );
+  // Initialize display driver
+  static lv_disp_drv_t disp_drv;
+  lv_disp_drv_init( &disp_drv );
+  disp_drv.hor_res = screenWidth;
+  disp_drv.ver_res = screenHeight;
+    disp_drv.flush_cb = my_disp_flush;
+    disp_drv.draw_buf = &draw_buf;
+  lv_disp_drv_register( &disp_drv );
+
+  // Initialize input device driver
+  static lv_indev_drv_t indev_drv;
+  lv_indev_drv_init( &indev_drv );
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+  indev_drv.read_cb = my_touchpad_read;
+  lv_indev_drv_register( &indev_drv );
   
-      /*初始化（虚拟）输入设备驱动程序*/
-      static lv_indev_drv_t indev_drv;
-      lv_indev_drv_init( &indev_drv );
-      indev_drv.type = LV_INDEV_TYPE_POINTER;
-      indev_drv.read_cb = my_touchpad_read;
-      lv_indev_drv_register( &indev_drv );
+  // Create IP display first (show immediately)
+  Serial.println("Creating IP display...");
+  createIPDisplay();
   
-  #if 0
-      /* 创建简单标签 */
-  //    lv_obj_t *label = lv_label_create( lv_scr_act() );
-  //    lv_label_set_text( label, LVGL_Arduino.c_str() );
-  //    lv_obj_align( label, LV_ALIGN_CENTER, 0, 0 );
-       lv_example_btn();
-  #else
-      /* 尝试lv_examples Arduino库中的一个示例
-         请确保按照上面所写的内容将其包括在内。
-      lv_example_btn_1();
-     */
+  // Force initial display refresh
+  lv_refr_now(NULL);
+  Serial.println("Initial display created");
   
-      // uncomment one of these demos
-      lv_demo_widgets();            // OK
-//      lv_demo_benchmark();          // OK
-      // lv_demo_keypad_encoder();     // works, but I haven't an encoder
-      //lv_demo_music();              // NOK
-      //lv_demo_printer();
-      //lv_demo_stress();             // seems to be OK
-  #endif
-      Serial.println( "Setup done" );
+  // Try to connect to WiFi (non-blocking)
+  Serial.println("Connecting to WiFi...");
+  connectToWiFi();
+  
+  // Configure time only if WiFi is connected
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Configuring time...");
+    configTime(GMT_OFFSET, DAYLIGHT_OFFSET, NTP_SERVER);
+  } else {
+    Serial.println("No WiFi - running in offline mode");
+  }
+  
+  Serial.println( "Setup done - IP Display should be running" );
 }
 
 void loop()
