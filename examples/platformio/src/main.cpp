@@ -80,7 +80,6 @@ uint8_t s_GT911_CfgParams[] =
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
@@ -514,7 +513,7 @@ void GT911_Int()
     data->point.x = Dev_Now.X[0];
     data->point.y = Dev_Now.Y[0];
     //Serial.printf("touch:%d, x_in:%d, y_in:%d, x_out:%d, y_out:%d\r\n", touched, Dev_Now.X[0], Dev_Now.Y[0], data->point.x, data->point.y);
-    data->state = LV_INDEV_STATE_PR;
+        data->state = LV_INDEV_STATE_PR;
   }
 }
 //*****************************************************************************************************//
@@ -555,9 +554,26 @@ lv_obj_t * weather_humidity_label;
 lv_obj_t * weather_pressure_label;
 lv_timer_t * weather_timer;
 
-// Screen mode
-enum ScreenMode { CLOCK_SCREEN, WEATHER_SCREEN };
-ScreenMode currentScreen = CLOCK_SCREEN;
+// Dashboard Display Objects
+lv_obj_t * dashboard_time_label;
+lv_obj_t * dashboard_date_label;
+lv_obj_t * dashboard_location_label;
+lv_obj_t * dashboard_weather_temp_label;
+lv_obj_t * dashboard_weather_desc_label;
+lv_obj_t * dashboard_weather_icon;
+lv_obj_t * dashboard_forecast_labels[3];
+lv_obj_t * dashboard_room_temp_label;
+lv_obj_t * dashboard_humidity_label;
+lv_obj_t * dashboard_set_temp_label;
+lv_obj_t * dashboard_greeting_label;
+lv_obj_t * dashboard_avatar;
+lv_obj_t * dashboard_wifi_icon;
+lv_obj_t * dashboard_battery_label;
+lv_timer_t * dashboard_timer;
+
+// Screen mode - only dashboard
+enum ScreenMode { DASHBOARD_SCREEN };
+ScreenMode currentScreen = DASHBOARD_SCREEN;
 
 // Touch debounce variables
 unsigned long lastTouchTime = 0;
@@ -755,7 +771,7 @@ void connectToWiFi() {
     Serial.print("Signal strength: ");
     Serial.print(WiFi.RSSI());
     Serial.println(" dBm");
-  } else {
+    } else {
     Serial.println("WiFi connection failed!");
     Serial.print("Final status: ");
     Serial.println(WiFi.status());
@@ -768,233 +784,385 @@ void connectToWiFi() {
 }
 
 // Update Display Function
-void updateDisplay(lv_timer_t * timer) {
-  // Only update if we're on the clock screen
-  if (currentScreen != CLOCK_SCREEN) {
-    return;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    // Update IP address
-    if (ip_label) {
-      IPAddress ip = WiFi.localIP();
-      String ipString = "IP: " + ip.toString();
-      lv_label_set_text(ip_label, ipString.c_str());
-    }
-    
-    // Update time
-    time_t now = time(nullptr);
-    if (now > 0) {  // Check if time is valid
-      struct tm * timeinfo = localtime(&now);
-      
-      if (time_label) {
-        char timeBuffer[20];
-        sprintf(timeBuffer, "%02d:%02d:%02d", timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
-        lv_label_set_text(time_label, timeBuffer);
-      }
-      
-      if (date_label) {
-        char dateBuffer[50];
-        const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", 
-                               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-        sprintf(dateBuffer, "%02d-%s-%04d", timeinfo->tm_mday, months[timeinfo->tm_mon], timeinfo->tm_year + 1900);
-        lv_label_set_text(date_label, dateBuffer);
-      }
-    } else {
-      if (time_label) lv_label_set_text(time_label, "Syncing...");
-      if (date_label) lv_label_set_text(date_label, "Time Sync");
-    }
-  } else {
-    // No WiFi - show offline clock
-    static unsigned long startTime = millis();
-    unsigned long currentTime = millis();
-    unsigned long seconds = (currentTime - startTime) / 1000;
-    
-    // Simple offline clock (starts from 00:00:00)
-    int hours = (seconds / 3600) % 24;
-    int minutes = (seconds / 60) % 60;
-    int secs = seconds % 60;
-    
-    if (time_label) {
-      char timeBuffer[20];
-      sprintf(timeBuffer, "%02d:%02d:%02d", hours, minutes, secs);
-      lv_label_set_text(time_label, timeBuffer);
-    }
-    
-    if (ip_label) lv_label_set_text(ip_label, "Offline Mode");
-    if (date_label) lv_label_set_text(date_label, "No Internet");
-  }
-}
+// Clock display function removed - only dashboard is used
 
-// Create IP Display UI
-void createIPDisplay() {
-  // Clear screen
-  lv_obj_clean(lv_scr_act());
-  
-  // Set white background
-  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0xFFFFFF), 0);
-  
-  // Create time label (center top) - Large bold font
-  time_label = lv_label_create(lv_scr_act());
-  lv_label_set_text(time_label, "Starting...");
-  lv_obj_set_style_text_font(time_label, &lv_font_montserrat_48, 0);
-  lv_obj_set_style_text_color(time_label, lv_color_hex(0x000000), 0);
-  lv_obj_align(time_label, LV_ALIGN_CENTER, 0, -30);
-  
-  // Create date label (center bottom) - Smaller font
-  date_label = lv_label_create(lv_scr_act());
-  lv_label_set_text(date_label, "Loading...");
-  lv_obj_set_style_text_font(date_label, &lv_font_montserrat_20, 0);
-  lv_obj_set_style_text_color(date_label, lv_color_hex(0x000000), 0);
-  lv_obj_align(date_label, LV_ALIGN_CENTER, 0, 20);
-  
-  // Create IP label (top right corner) - Small font
-  ip_label = lv_label_create(lv_scr_act());
-  lv_label_set_text(ip_label, "IP: Connecting...");
-  lv_obj_set_style_text_font(ip_label, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(ip_label, lv_color_hex(0x666666), 0);
-  lv_obj_align(ip_label, LV_ALIGN_TOP_RIGHT, -10, 10);
-  
-  // Create update timer
-  update_timer = lv_timer_create(updateDisplay, 1000, NULL);
-}
+// IP Display function removed - only dashboard is used
 
 // Weather API Function
+// Weather functions removed - only dashboard is used
+
+// Function declarations
+void createDashboardDisplay();
+
+// Fetch weather data from API (called every hour)
 void fetchWeatherData() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected, cannot fetch weather data");
+    Serial.println("WiFi not connected, skipping weather update");
     return;
   }
-
-  HTTPClient http;
-  String url = "http://api.openweathermap.org/data/2.5/weather?q=" + String(WEATHER_CITY) + "," + String(WEATHER_COUNTRY) + "&appid=" + String(WEATHER_API_KEY) + "&units=metric";
   
-  Serial.println("Fetching weather data from: " + url);
+  HTTPClient http;
+  // Use the 5 day / 3 hour forecast API to get daily predictions
+  String url = "http://api.openweathermap.org/data/2.5/forecast?q=" + String(WEATHER_CITY) + "," + String(WEATHER_COUNTRY) + "&appid=" + String(WEATHER_API_KEY) + "&units=metric";
   
   http.begin(url);
-  int httpResponseCode = http.GET();
+  int httpCode = http.GET();
   
-  if (httpResponseCode > 0) {
-    String response = http.getString();
-    Serial.println("Weather API Response: " + response);
+  if (httpCode > 0) {
+    String payload = http.getString();
+    // Serial.println("Forecast API Response: " + payload); // Can be very long
     
-    // Parse JSON response
     JsonDocument doc;
-    deserializeJson(doc, response);
+    deserializeJson(doc, payload);
     
-    if (doc["cod"] == 200) {
-      float temperature = doc["main"]["temp"];
-      String description = doc["weather"][0]["description"];
-      int humidity = doc["main"]["humidity"];
-      int pressure = doc["main"]["pressure"];
+    if (doc["list"]) {
+      // --- Update CURRENT weather from the first forecast entry ---
+      float temp = doc["list"][0]["main"]["temp"];
+      float temp_max = doc["list"][0]["main"]["temp_max"];
+      int humidity = doc["list"][0]["main"]["humidity"];
+      String description = doc["list"][0]["weather"][0]["description"];
       
-      // Update weather display
-      if (weather_temp_label) {
-        char tempBuffer[20];
-        sprintf(tempBuffer, "%.1f°C", temperature);
-        lv_label_set_text(weather_temp_label, tempBuffer);
+      // Update weather widget (center)
+      if (dashboard_weather_temp_label) {
+        char tempBuffer[10];
+        sprintf(tempBuffer, "%.0f°C", temp);
+        lv_label_set_text(dashboard_weather_temp_label, tempBuffer);
       }
       
-      if (weather_desc_label) {
-        lv_label_set_text(weather_desc_label, description.c_str());
+      if (dashboard_weather_desc_label) {
+        String desc = description;
+        desc.toUpperCase();
+        lv_label_set_text(dashboard_weather_desc_label, desc.c_str());
       }
       
-      if (weather_humidity_label) {
-        char humidityBuffer[30];
-        sprintf(humidityBuffer, "Humidity: %d%%", humidity);
-        lv_label_set_text(weather_humidity_label, humidityBuffer);
+      lv_obj_t * max_temp_label = lv_obj_get_child(lv_obj_get_parent(dashboard_weather_temp_label), 1);
+      if (max_temp_label) {
+        char maxTempBuffer[15];
+        sprintf(maxTempBuffer, "MAX %.0f°C", temp_max);
+        lv_label_set_text(max_temp_label, maxTempBuffer);
+      }
+
+      // Update temperature widget (right) with real data
+      if (dashboard_set_temp_label) {
+        char tempBuffer[10];
+        sprintf(tempBuffer, "%.1f°C", temp);
+        lv_label_set_text(dashboard_set_temp_label, tempBuffer);
+      }
+      if (dashboard_room_temp_label) {
+        char currentTempBuffer[20];
+        sprintf(currentTempBuffer, "CURRENT %.1f°", temp);
+        lv_label_set_text(dashboard_room_temp_label, currentTempBuffer);
+      }
+      if (dashboard_humidity_label) {
+        char humidityBuffer[20];
+        sprintf(humidityBuffer, "HUMIDITY %d%%", humidity);
+        lv_label_set_text(dashboard_humidity_label, humidityBuffer);
+      }
+
+      // --- Update FORECAST labels for the next 3 days ---
+      // We'll pick forecasts at roughly 24h intervals (8th, 16th, 24th entry in a 3-hour list)
+      const int forecasts_to_show = 3;
+      int forecast_indices[] = {7, 15, 23}; // Approx. 24, 48, 72 hours ahead
+
+      for (int i = 0; i < forecasts_to_show; i++) {
+        if (dashboard_forecast_labels[i]) {
+          int index = forecast_indices[i];
+          if (doc["list"][index]) {
+            String forecast_desc = doc["list"][index]["weather"][0]["main"];
+            char forecastBuffer[30];
+            sprintf(forecastBuffer, "Day +%d: %s", i + 1, forecast_desc.c_str());
+            lv_label_set_text(dashboard_forecast_labels[i], forecastBuffer);
+          }
+        }
       }
       
-      if (weather_pressure_label) {
-        char pressureBuffer[30];
-        sprintf(pressureBuffer, "Pressure: %d hPa", pressure);
-        lv_label_set_text(weather_pressure_label, pressureBuffer);
-      }
-      
-      Serial.println("Weather data updated successfully");
-    } else {
-      Serial.println("Weather API error: " + String(doc["message"].as<String>()));
+      Serial.println("Weather and forecast data updated successfully");
     }
   } else {
-    Serial.println("HTTP request failed with code: " + String(httpResponseCode));
+    Serial.println("Forecast API request failed: " + String(httpCode));
   }
   
   http.end();
 }
 
-// Weather Update Function
-void updateWeather(lv_timer_t * timer) {
-  // Only update if we're on the weather screen
-  if (currentScreen != WEATHER_SCREEN) {
-    return;
-  }
-  fetchWeatherData();
+// Switch between screens
+void switchScreen() {
+  // Only dashboard screen - no switching needed
+  Serial.println("Dashboard screen - no switching available");
 }
 
-// Create Weather Display UI
-void createWeatherDisplay() {
+// Dashboard Update Function
+void updateDashboard(lv_timer_t * timer) {
+  // Only update if we're on the dashboard screen
+  if (currentScreen != DASHBOARD_SCREEN) {
+    return;
+  }
+  
+  // Static variable to track weather update timing (every hour)
+  static unsigned long lastWeatherUpdate = 0;
+  unsigned long currentTime = millis();
+  
+  // Update time and date (every second)
+  time_t now = time(nullptr);
+  if (now > 1000000000) { // Check if time is properly synced (after year 2001)
+    struct tm * timeinfo = localtime(&now);
+    
+    if (dashboard_time_label) {
+      char timeBuffer[20];
+      sprintf(timeBuffer, "%02d:%02d", timeinfo->tm_hour, timeinfo->tm_min);
+      lv_label_set_text(dashboard_time_label, timeBuffer);
+    }
+    
+    if (dashboard_date_label) {
+      char dateBuffer[50];
+      const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+      const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+      sprintf(dateBuffer, "%s, %s %d", days[timeinfo->tm_wday], months[timeinfo->tm_mon], timeinfo->tm_mday);
+      lv_label_set_text(dashboard_date_label, dateBuffer);
+    }
+    
+    // Update weather data only every hour (3600000 ms = 1 hour)
+    if (currentTime - lastWeatherUpdate > 3600000 || lastWeatherUpdate == 0) {
+      Serial.println("Updating weather data (hourly update)...");
+      fetchWeatherData();
+      lastWeatherUpdate = currentTime;
+    }
+  } else {
+    // Time not synced yet, show syncing status
+    if (dashboard_time_label) {
+      lv_label_set_text(dashboard_time_label, "Syncing...");
+    }
+    if (dashboard_date_label) {
+      lv_label_set_text(dashboard_date_label, "Connecting...");
+    }
+    
+    // Try to sync time again if WiFi is connected
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("Time not synced, reconfiguring NTP...");
+      configTime(GMT_OFFSET, DAYLIGHT_OFFSET, NTP_SERVER);
+    }
+  }
+  
+  // Update greeting based on time
+  if (dashboard_greeting_label) {
+    time_t now = time(nullptr);
+    if (now > 0) {
+      struct tm * timeinfo = localtime(&now);
+      int hour = timeinfo->tm_hour;
+      
+      if (hour < 10) {
+        lv_label_set_text(dashboard_greeting_label, "Good morning, Eko!");
+      } else if (hour < 18) {
+        lv_label_set_text(dashboard_greeting_label, "Good afternoon, Eko!");
+      } else {
+        lv_label_set_text(dashboard_greeting_label, "Good evening, Eko!");
+      }
+    }
+  }
+  
+         // Update room temperature (simulated) - REMOVED, now updated from API
+         // if (dashboard_room_temp_label) {
+         //   static float roomTemp = 22.5;
+         //   roomTemp += (random(-10, 11) / 100.0); // Small random variation
+         //   if (roomTemp < 20) roomTemp = 20;
+         //   if (roomTemp > 25) roomTemp = 25;
+           
+         //   char tempBuffer[20];
+         //   sprintf(tempBuffer, "CURRENT %.1f°", roomTemp);
+         //   lv_label_set_text(dashboard_room_temp_label, tempBuffer);
+         // }
+         
+         // Update humidity (simulated) - REMOVED, now updated from API
+         // if (dashboard_humidity_label) {
+         //   static int humidity = 65;
+         //   humidity += random(-2, 3);
+         //   if (humidity < 50) humidity = 50;
+         //   if (humidity > 80) humidity = 80;
+           
+         //   char humidityBuffer[20];
+         //   sprintf(humidityBuffer, "HUMIDITY %d%%", humidity);
+         //   lv_label_set_text(dashboard_humidity_label, humidityBuffer);
+         // }
+         
+         // Update weather forecast (simulated) - REMOVED, now updated from API
+         // for (int i = 0; i < 3; i++) {
+         //   if (dashboard_forecast_labels[i]) {
+         //     static int forecastTemps[3] = {30, 32, 28};
+         //     forecastTemps[i] += random(-1, 2);
+         //     if (forecastTemps[i] < 25) forecastTemps[i] = 25;
+         //     if (forecastTemps[i] > 35) forecastTemps[i] = 35;
+             
+         //     char forecastBuffer[30];
+         //     sprintf(forecastBuffer, "Day %d: %d°C", i + 1, forecastTemps[i]);
+         //     lv_label_set_text(dashboard_forecast_labels[i], forecastBuffer);
+         //   }
+         // }
+}
+
+// Create Dashboard Display UI
+void createDashboardDisplay() {
   // Clear screen
   lv_obj_clean(lv_scr_act());
   
-  // Set white background
-  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0xFFFFFF), 0);
+  // Set modern dark background
+  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x0f172a), 0);
   
-  // Create temperature label (center top) - Large font
-  weather_temp_label = lv_label_create(lv_scr_act());
-  lv_label_set_text(weather_temp_label, "Loading...");
-  lv_obj_set_style_text_font(weather_temp_label, &lv_font_montserrat_48, 0);
-  lv_obj_set_style_text_color(weather_temp_label, lv_color_hex(0x000000), 0);
-  lv_obj_align(weather_temp_label, LV_ALIGN_CENTER, 0, -60);
+  // Top bar - compact
+  lv_obj_t * top_bar = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(top_bar, 480, 35);
+  lv_obj_set_pos(top_bar, 0, 0);
+  lv_obj_set_style_bg_color(top_bar, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(top_bar, 0, 0);
+  lv_obj_set_style_radius(top_bar, 0, 0);
   
-  // Create description label (center)
-  weather_desc_label = lv_label_create(lv_scr_act());
-  lv_label_set_text(weather_desc_label, "Weather");
-  lv_obj_set_style_text_font(weather_desc_label, &lv_font_montserrat_20, 0);
-  lv_obj_set_style_text_color(weather_desc_label, lv_color_hex(0x000000), 0);
-  lv_obj_align(weather_desc_label, LV_ALIGN_CENTER, 0, -10);
+  // Date in top bar (left)
+  dashboard_date_label = lv_label_create(top_bar);
+  lv_label_set_text(dashboard_date_label, "Sat, Sep 27");
+  lv_obj_set_style_text_color(dashboard_date_label, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_font(dashboard_date_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(dashboard_date_label, LV_ALIGN_LEFT_MID, 15, 0);
   
-  // Create humidity label (center bottom)
-  weather_humidity_label = lv_label_create(lv_scr_act());
-  lv_label_set_text(weather_humidity_label, "Humidity: --%");
-  lv_obj_set_style_text_font(weather_humidity_label, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(weather_humidity_label, lv_color_hex(0x000000), 0);
-  lv_obj_align(weather_humidity_label, LV_ALIGN_CENTER, 0, 30);
+  // Greeting (right side)
+  dashboard_greeting_label = lv_label_create(top_bar);
+  lv_label_set_text(dashboard_greeting_label, "Good morning, Eko!");
+  lv_obj_set_style_text_color(dashboard_greeting_label, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_font(dashboard_greeting_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(dashboard_greeting_label, LV_ALIGN_RIGHT_MID, -15, 0);
   
-  // Create pressure label (center bottom)
-  weather_pressure_label = lv_label_create(lv_scr_act());
-  lv_label_set_text(weather_pressure_label, "Pressure: -- hPa");
-  lv_obj_set_style_text_font(weather_pressure_label, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(weather_pressure_label, lv_color_hex(0x000000), 0);
-  lv_obj_align(weather_pressure_label, LV_ALIGN_CENTER, 0, 60);
+  // Main content area - more space
+  lv_obj_t * main_area = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(main_area, 480, 285);
+  lv_obj_set_pos(main_area, 0, 35);
+  lv_obj_set_style_bg_color(main_area, lv_color_hex(0x0f172a), 0);
+  lv_obj_set_style_border_width(main_area, 0, 0);
+  lv_obj_set_style_radius(main_area, 0, 0);
   
-  // Create weather update timer (every 10 minutes)
-  weather_timer = lv_timer_create(updateWeather, 600000, NULL);
+  // Row 1: Time, Weather, Temperature (3 equal columns - within 450px from left)
+  // Green box reference: 450px wide from x=0 (left edge)
+  // Top widgets should fit within same 450px area
+  // Widget width: 140px each, Gap: 15px between widgets  
+  // Layout within 450px: 140px + 15px + 140px + 15px + 140px = 450px (perfect fit!)
   
-  // Fetch initial weather data
-  fetchWeatherData();
-}
+  // Widget 1: Time and Location
+  lv_obj_t * time_widget = lv_obj_create(main_area);
+  lv_obj_set_size(time_widget, 140, 120);
+  lv_obj_set_pos(time_widget, 0, 10);
+  lv_obj_set_style_bg_color(time_widget, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(time_widget, 1, 0);
+  lv_obj_set_style_border_color(time_widget, lv_color_hex(0x334155), 0);
+  lv_obj_set_style_radius(time_widget, 8, 0);
+  
+  dashboard_time_label = lv_label_create(time_widget);
+  lv_label_set_text(dashboard_time_label, "09:56");
+  lv_obj_set_style_text_color(dashboard_time_label, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_font(dashboard_time_label, &lv_font_montserrat_28, 0);
+  lv_obj_align(dashboard_time_label, LV_ALIGN_CENTER, 0, -10);
+  
+  dashboard_location_label = lv_label_create(time_widget);
+  lv_label_set_text(dashboard_location_label, "Jakarta, ID");
+  lv_obj_set_style_text_color(dashboard_location_label, lv_color_hex(0x94a3b8), 0);
+  lv_obj_set_style_text_font(dashboard_location_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(dashboard_location_label, LV_ALIGN_BOTTOM_MID, 0, -15);
+  
+  // Widget 2: Current Weather (center)
+  lv_obj_t * weather_widget = lv_obj_create(main_area);
+  lv_obj_set_size(weather_widget, 140, 120);
+  lv_obj_set_pos(weather_widget, 155, 10);
+  lv_obj_set_style_bg_color(weather_widget, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(weather_widget, 1, 0);
+  lv_obj_set_style_border_color(weather_widget, lv_color_hex(0x334155), 0);
+  lv_obj_set_style_radius(weather_widget, 8, 0);
+  
+  dashboard_weather_temp_label = lv_label_create(weather_widget);
+  lv_label_set_text(dashboard_weather_temp_label, "32°C");
+  lv_obj_set_style_text_color(dashboard_weather_temp_label, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_font(dashboard_weather_temp_label, &lv_font_montserrat_20, 0);
+  lv_obj_align(dashboard_weather_temp_label, LV_ALIGN_TOP_MID, 0, 10);
+  
+  lv_obj_t * max_temp_label = lv_label_create(weather_widget);
+  lv_label_set_text(max_temp_label, "MAX 35°C");
+  lv_obj_set_style_text_color(max_temp_label, lv_color_hex(0x94a3b8), 0);
+  lv_obj_set_style_text_font(max_temp_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(max_temp_label, LV_ALIGN_TOP_MID, 0, 35);
+  
+  dashboard_weather_icon = lv_label_create(weather_widget);
+  lv_label_set_text(dashboard_weather_icon, "☁️");
+  lv_obj_set_style_text_font(dashboard_weather_icon, &lv_font_montserrat_16, 0);
+  lv_obj_align(dashboard_weather_icon, LV_ALIGN_BOTTOM_MID, 0, -30);
+  
+  dashboard_weather_desc_label = lv_label_create(weather_widget);
+  lv_label_set_text(dashboard_weather_desc_label, "Overcast");
+  lv_obj_set_style_text_color(dashboard_weather_desc_label, lv_color_hex(0x94a3b8), 0);
+  lv_obj_set_style_text_font(dashboard_weather_desc_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(dashboard_weather_desc_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+  
+  // Widget 3: Temperature Control (right)
+  lv_obj_t * temp_widget = lv_obj_create(main_area);
+  lv_obj_set_size(temp_widget, 140, 120);
+  lv_obj_set_pos(temp_widget, 310, 10);
+  lv_obj_set_style_bg_color(temp_widget, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(temp_widget, 1, 0);
+  lv_obj_set_style_border_color(temp_widget, lv_color_hex(0x334155), 0);
+  lv_obj_set_style_radius(temp_widget, 8, 0);
+  
+  lv_obj_t * temp_title = lv_label_create(temp_widget);
+  lv_label_set_text(temp_title, "Temperature");
+  lv_obj_set_style_text_color(temp_title, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_font(temp_widget, &lv_font_montserrat_14, 0);
+  lv_obj_align(temp_title, LV_ALIGN_TOP_MID, 0, 5);
+  
+  dashboard_set_temp_label = lv_label_create(temp_widget);
+  lv_label_set_text(dashboard_set_temp_label, "23°C");
+  lv_obj_set_style_text_color(dashboard_set_temp_label, lv_color_hex(0x06b6d4), 0);
+  lv_obj_set_style_text_font(dashboard_set_temp_label, &lv_font_montserrat_20, 0);
+  lv_obj_align(dashboard_set_temp_label, LV_ALIGN_TOP_MID, 0, 23);
+  
+  dashboard_room_temp_label = lv_label_create(temp_widget);
+  lv_label_set_text(dashboard_room_temp_label, "CURRENT 22.0°");
+  lv_obj_set_style_text_color(dashboard_room_temp_label, lv_color_hex(0x94a3b8), 0);
+  lv_obj_set_style_text_font(dashboard_room_temp_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(dashboard_room_temp_label, LV_ALIGN_BOTTOM_MID, 0, -25);
+  
+  dashboard_humidity_label = lv_label_create(temp_widget);
+  lv_label_set_text(dashboard_humidity_label, "HUMIDITY 69%");
+  lv_obj_set_style_text_color(dashboard_humidity_label, lv_color_hex(0x94a3b8), 0);
+  lv_obj_set_style_text_font(dashboard_humidity_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(dashboard_humidity_label, LV_ALIGN_BOTTOM_MID, 0, -5);
+  
+  // Row 2: Forecast (450px wide from left edge - matching green box)
+  lv_obj_t * forecast_widget = lv_obj_create(main_area);
+  lv_obj_set_size(forecast_widget, 450, 55);
+  lv_obj_set_pos(forecast_widget, 0, 140);
+  lv_obj_set_style_bg_color(forecast_widget, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(forecast_widget, 1, 0);
+  lv_obj_set_style_border_color(forecast_widget, lv_color_hex(0x334155), 0);
+  lv_obj_set_style_radius(forecast_widget, 8, 0);
+  
+  // 3-day forecast in horizontal layout
+  for (int i = 0; i < 3; i++) {
+    dashboard_forecast_labels[i] = lv_label_create(forecast_widget);
+    char forecast[20];
+    sprintf(forecast, "Day + %d: 27°C", i + 1);
+    lv_label_set_text(dashboard_forecast_labels[i], forecast);
+    lv_obj_set_style_text_color(dashboard_forecast_labels[i], lv_color_hex(0x94a3b8), 0);
+    lv_obj_set_style_text_font(dashboard_forecast_labels[i], &lv_font_montserrat_14, 0);
+    lv_obj_align(dashboard_forecast_labels[i], LV_ALIGN_LEFT_MID, 20 + (i * 140), 0);
+  }
+  
+  // Green box at bottom (450px wide from left edge - as originally working)
+  lv_obj_t * green_box = lv_obj_create(main_area);
+  lv_obj_set_size(green_box, 450, 40);
+  lv_obj_set_pos(green_box, 0, 205);
+  lv_obj_set_style_bg_color(green_box, lv_color_hex(0x00FF00), 0);
+  lv_obj_set_style_border_width(green_box, 0, 0);
+  lv_obj_set_style_radius(green_box, 8, 0);
 
-// Switch between screens
-void switchScreen() {
-  // Stop existing timers to prevent conflicts
-  if (update_timer) {
-    lv_timer_del(update_timer);
-    update_timer = NULL;
-  }
-  if (weather_timer) {
-    lv_timer_del(weather_timer);
-    weather_timer = NULL;
-  }
+  // Create dashboard update timer
+  dashboard_timer = lv_timer_create(updateDashboard, 1000, NULL);
   
-  if (currentScreen == CLOCK_SCREEN) {
-    currentScreen = WEATHER_SCREEN;
-    createWeatherDisplay();
-    Serial.println("Switched to Weather screen");
-  } else {
-    currentScreen = CLOCK_SCREEN;
-    createIPDisplay();
-    Serial.println("Switched to Clock screen");
-  }
+  // Initial update
+  updateDashboard(NULL);
 }
 
 /* 显示器刷新 */
@@ -1169,9 +1337,9 @@ void setup()
   indev_drv.read_cb = my_touchpad_read;
   lv_indev_drv_register( &indev_drv );
   
-  // Create IP display first (show immediately)
-  Serial.println("Creating IP display...");
-  createIPDisplay();
+  // Create dashboard display first (show immediately)
+  Serial.println("Creating dashboard display...");
+  createDashboardDisplay();
   
   // Force initial display refresh
   lv_refr_now(NULL);
@@ -1194,44 +1362,8 @@ void setup()
 
 void loop()
 {
-  // Check for touch input to switch screens
-  GT911_Scan();
-  
-  // Only process touch if it's a valid touch (not noise)
-  if (Dev_Now.TouchCount > 0) {
-    unsigned long currentTime = millis();
-    
-    // Check debounce time
-    if (currentTime - lastTouchTime < TOUCH_DEBOUNCE_MS) {
-      Serial.println("Touch ignored - too soon after last touch");
-      return;
-    }
-    
-    // Check if touch coordinates are valid (not 0,0 or invalid)
-    bool validTouch = false;
-    for (int i = 0; i < Dev_Now.TouchCount; i++) {
-      if (Dev_Now.X[i] > 10 && Dev_Now.Y[i] > 10 && 
-          Dev_Now.X[i] < screenWidth - 10 && Dev_Now.Y[i] < screenHeight - 10) {
-        validTouch = true;
-        break;
-      }
-    }
-    
-    if (validTouch) {
-      Serial.print("Valid touch detected at: ");
-      Serial.print(Dev_Now.X[0]);
-      Serial.print(", ");
-      Serial.println(Dev_Now.Y[0]);
-      
-      // Update last touch time
-      lastTouchTime = currentTime;
-      
-      // Touch detected - switch screens
-      switchScreen();
-    } else {
-      Serial.println("Invalid touch detected (ignored)");
-    }
-  }
+         // Touch input disabled - only dashboard screen
+         GT911_Scan();
 
   lv_timer_handler(); /* 让GUI完成它的工作 */
   delay( 10 );
