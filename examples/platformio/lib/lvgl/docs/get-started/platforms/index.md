@@ -9,7 +9,6 @@
    nxp
    stm32
    espressif
-   renesas
    arduino
    tasmota-berry
    cmake
