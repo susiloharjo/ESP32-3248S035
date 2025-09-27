@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <time.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 
 #include <lvgl.h>
 #include <TFT_eSPI.h>
@@ -535,11 +537,31 @@ const char* NTP_SERVER = "pool.ntp.org";
 const long GMT_OFFSET = 7 * 3600; // GMT+7 (Indonesia)
 const int DAYLIGHT_OFFSET = 0;
 
-// LVGL IP Display Objects
+// Weather Configuration
+const char* WEATHER_API_KEY = "85c6d3d4179e4f92a2b7eaf04d7a104e"; // openweathermap.org
+const char* WEATHER_CITY = "Jakarta"; // Your city
+const char* WEATHER_COUNTRY = "ID"; // Your country code
+
+// LVGL Display Objects
 lv_obj_t * ip_label;
 lv_obj_t * time_label;
 lv_obj_t * date_label;
 lv_timer_t * update_timer;
+
+// Weather Display Objects
+lv_obj_t * weather_temp_label;
+lv_obj_t * weather_desc_label;
+lv_obj_t * weather_humidity_label;
+lv_obj_t * weather_pressure_label;
+lv_timer_t * weather_timer;
+
+// Screen mode
+enum ScreenMode { CLOCK_SCREEN, WEATHER_SCREEN };
+ScreenMode currentScreen = CLOCK_SCREEN;
+
+// Touch debounce variables
+unsigned long lastTouchTime = 0;
+const unsigned long TOUCH_DEBOUNCE_MS = 3000; // 3 seconds minimum between touches
 
 #if LV_USE_LOG != 0
 /* 串行调试 */
@@ -747,29 +769,40 @@ void connectToWiFi() {
 
 // Update Display Function
 void updateDisplay(lv_timer_t * timer) {
+  // Only update if we're on the clock screen
+  if (currentScreen != CLOCK_SCREEN) {
+    return;
+  }
+  
   if (WiFi.status() == WL_CONNECTED) {
     // Update IP address
-    IPAddress ip = WiFi.localIP();
-    String ipString = "IP: " + ip.toString();
-    lv_label_set_text(ip_label, ipString.c_str());
+    if (ip_label) {
+      IPAddress ip = WiFi.localIP();
+      String ipString = "IP: " + ip.toString();
+      lv_label_set_text(ip_label, ipString.c_str());
+    }
     
     // Update time
     time_t now = time(nullptr);
     if (now > 0) {  // Check if time is valid
       struct tm * timeinfo = localtime(&now);
       
-      char timeBuffer[20];
-      sprintf(timeBuffer, "%02d:%02d:%02d", timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
-      lv_label_set_text(time_label, timeBuffer);
+      if (time_label) {
+        char timeBuffer[20];
+        sprintf(timeBuffer, "%02d:%02d:%02d", timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+        lv_label_set_text(time_label, timeBuffer);
+      }
       
-      char dateBuffer[50];
-      const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", 
-                             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-      sprintf(dateBuffer, "%02d-%s-%04d", timeinfo->tm_mday, months[timeinfo->tm_mon], timeinfo->tm_year + 1900);
-      lv_label_set_text(date_label, dateBuffer);
+      if (date_label) {
+        char dateBuffer[50];
+        const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+        sprintf(dateBuffer, "%02d-%s-%04d", timeinfo->tm_mday, months[timeinfo->tm_mon], timeinfo->tm_year + 1900);
+        lv_label_set_text(date_label, dateBuffer);
+      }
     } else {
-      lv_label_set_text(time_label, "Syncing...");
-      lv_label_set_text(date_label, "Time Sync");
+      if (time_label) lv_label_set_text(time_label, "Syncing...");
+      if (date_label) lv_label_set_text(date_label, "Time Sync");
     }
   } else {
     // No WiFi - show offline clock
@@ -782,12 +815,14 @@ void updateDisplay(lv_timer_t * timer) {
     int minutes = (seconds / 60) % 60;
     int secs = seconds % 60;
     
-    char timeBuffer[20];
-    sprintf(timeBuffer, "%02d:%02d:%02d", hours, minutes, secs);
-    lv_label_set_text(time_label, timeBuffer);
+    if (time_label) {
+      char timeBuffer[20];
+      sprintf(timeBuffer, "%02d:%02d:%02d", hours, minutes, secs);
+      lv_label_set_text(time_label, timeBuffer);
+    }
     
-    lv_label_set_text(ip_label, "Offline Mode");
-    lv_label_set_text(date_label, "No Internet");
+    if (ip_label) lv_label_set_text(ip_label, "Offline Mode");
+    if (date_label) lv_label_set_text(date_label, "No Internet");
   }
 }
 
@@ -822,6 +857,144 @@ void createIPDisplay() {
   
   // Create update timer
   update_timer = lv_timer_create(updateDisplay, 1000, NULL);
+}
+
+// Weather API Function
+void fetchWeatherData() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, cannot fetch weather data");
+    return;
+  }
+
+  HTTPClient http;
+  String url = "http://api.openweathermap.org/data/2.5/weather?q=" + String(WEATHER_CITY) + "," + String(WEATHER_COUNTRY) + "&appid=" + String(WEATHER_API_KEY) + "&units=metric";
+  
+  Serial.println("Fetching weather data from: " + url);
+  
+  http.begin(url);
+  int httpResponseCode = http.GET();
+  
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.println("Weather API Response: " + response);
+    
+    // Parse JSON response
+    JsonDocument doc;
+    deserializeJson(doc, response);
+    
+    if (doc["cod"] == 200) {
+      float temperature = doc["main"]["temp"];
+      String description = doc["weather"][0]["description"];
+      int humidity = doc["main"]["humidity"];
+      int pressure = doc["main"]["pressure"];
+      
+      // Update weather display
+      if (weather_temp_label) {
+        char tempBuffer[20];
+        sprintf(tempBuffer, "%.1f°C", temperature);
+        lv_label_set_text(weather_temp_label, tempBuffer);
+      }
+      
+      if (weather_desc_label) {
+        lv_label_set_text(weather_desc_label, description.c_str());
+      }
+      
+      if (weather_humidity_label) {
+        char humidityBuffer[30];
+        sprintf(humidityBuffer, "Humidity: %d%%", humidity);
+        lv_label_set_text(weather_humidity_label, humidityBuffer);
+      }
+      
+      if (weather_pressure_label) {
+        char pressureBuffer[30];
+        sprintf(pressureBuffer, "Pressure: %d hPa", pressure);
+        lv_label_set_text(weather_pressure_label, pressureBuffer);
+      }
+      
+      Serial.println("Weather data updated successfully");
+    } else {
+      Serial.println("Weather API error: " + String(doc["message"].as<String>()));
+    }
+  } else {
+    Serial.println("HTTP request failed with code: " + String(httpResponseCode));
+  }
+  
+  http.end();
+}
+
+// Weather Update Function
+void updateWeather(lv_timer_t * timer) {
+  // Only update if we're on the weather screen
+  if (currentScreen != WEATHER_SCREEN) {
+    return;
+  }
+  fetchWeatherData();
+}
+
+// Create Weather Display UI
+void createWeatherDisplay() {
+  // Clear screen
+  lv_obj_clean(lv_scr_act());
+  
+  // Set white background
+  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0xFFFFFF), 0);
+  
+  // Create temperature label (center top) - Large font
+  weather_temp_label = lv_label_create(lv_scr_act());
+  lv_label_set_text(weather_temp_label, "Loading...");
+  lv_obj_set_style_text_font(weather_temp_label, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(weather_temp_label, lv_color_hex(0x000000), 0);
+  lv_obj_align(weather_temp_label, LV_ALIGN_CENTER, 0, -60);
+  
+  // Create description label (center)
+  weather_desc_label = lv_label_create(lv_scr_act());
+  lv_label_set_text(weather_desc_label, "Weather");
+  lv_obj_set_style_text_font(weather_desc_label, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(weather_desc_label, lv_color_hex(0x000000), 0);
+  lv_obj_align(weather_desc_label, LV_ALIGN_CENTER, 0, -10);
+  
+  // Create humidity label (center bottom)
+  weather_humidity_label = lv_label_create(lv_scr_act());
+  lv_label_set_text(weather_humidity_label, "Humidity: --%");
+  lv_obj_set_style_text_font(weather_humidity_label, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(weather_humidity_label, lv_color_hex(0x000000), 0);
+  lv_obj_align(weather_humidity_label, LV_ALIGN_CENTER, 0, 30);
+  
+  // Create pressure label (center bottom)
+  weather_pressure_label = lv_label_create(lv_scr_act());
+  lv_label_set_text(weather_pressure_label, "Pressure: -- hPa");
+  lv_obj_set_style_text_font(weather_pressure_label, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(weather_pressure_label, lv_color_hex(0x000000), 0);
+  lv_obj_align(weather_pressure_label, LV_ALIGN_CENTER, 0, 60);
+  
+  // Create weather update timer (every 10 minutes)
+  weather_timer = lv_timer_create(updateWeather, 600000, NULL);
+  
+  // Fetch initial weather data
+  fetchWeatherData();
+}
+
+// Switch between screens
+void switchScreen() {
+  // Stop existing timers to prevent conflicts
+  if (update_timer) {
+    lv_timer_del(update_timer);
+    update_timer = NULL;
+  }
+  if (weather_timer) {
+    lv_timer_del(weather_timer);
+    weather_timer = NULL;
+  }
+  
+  if (currentScreen == CLOCK_SCREEN) {
+    currentScreen = WEATHER_SCREEN;
+    createWeatherDisplay();
+    Serial.println("Switched to Weather screen");
+  } else {
+    currentScreen = CLOCK_SCREEN;
+    createIPDisplay();
+    Serial.println("Switched to Clock screen");
+  }
 }
 
 /* 显示器刷新 */
@@ -1021,13 +1194,46 @@ void setup()
 
 void loop()
 {
-     
+  // Check for touch input to switch screens
+  GT911_Scan();
+  
+  // Only process touch if it's a valid touch (not noise)
+  if (Dev_Now.TouchCount > 0) {
+    unsigned long currentTime = millis();
+    
+    // Check debounce time
+    if (currentTime - lastTouchTime < TOUCH_DEBOUNCE_MS) {
+      Serial.println("Touch ignored - too soon after last touch");
+      return;
+    }
+    
+    // Check if touch coordinates are valid (not 0,0 or invalid)
+    bool validTouch = false;
+    for (int i = 0; i < Dev_Now.TouchCount; i++) {
+      if (Dev_Now.X[i] > 10 && Dev_Now.Y[i] > 10 && 
+          Dev_Now.X[i] < screenWidth - 10 && Dev_Now.Y[i] < screenHeight - 10) {
+        validTouch = true;
+        break;
+      }
+    }
+    
+    if (validTouch) {
+      Serial.print("Valid touch detected at: ");
+      Serial.print(Dev_Now.X[0]);
+      Serial.print(", ");
+      Serial.println(Dev_Now.Y[0]);
+      
+      // Update last touch time
+      lastTouchTime = currentTime;
+      
+      // Touch detected - switch screens
+      switchScreen();
+    } else {
+      Serial.println("Invalid touch detected (ignored)");
+    }
+  }
 
-  //GT911_Scan();
-  //tft.fillCircle(Dev_Now.X[0], Dev_Now.Y[0], 0, TFT_RED);
-  //tft.fillCircle(30, 20, 1, TFT_RED);
   lv_timer_handler(); /* 让GUI完成它的工作 */
-  //tft.fillCircle(Dev_Now.X[0], Dev_Now.Y[0], 1, TFT_RED);
   delay( 10 );
 }
 /*
