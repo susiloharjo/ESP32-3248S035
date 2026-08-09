@@ -4,6 +4,7 @@
 #include <time.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include "esp_system.h" // esp_reset_reason() - TEMP/DEBUG, see setup()
 
 #include <lvgl.h>
 #include <TFT_eSPI.h>
@@ -307,7 +308,9 @@ void GT911_Scan(void)
       GT911_WR_Reg(GT911_READ_XY_REG, (uint8_t *)&Clearbuf, 1);
       // Serial.printf("No touch\r\n"); // silenced: this fires ~100x/sec and
       // drowns out the touch-calibration diagnostic prints below.
-      delay(10);
+      // (delay(10) that used to sit here on every untouched poll was pure
+      // latency for no benefit - removed; it was making rapid T9 multi-taps
+      // feel sluggish since this runs on every single touch poll.)
     }
     else
     {
@@ -607,8 +610,14 @@ void runTouchCalibration() {
   lv_obj_clear_flag(target, LV_OBJ_FLAG_CLICKABLE);
 
   // Pulled well clear of the true edges - on-device testing found a dead
-  // strip near the top (and likely the right) of the touch-sensitive area,
-  // so points too close to those edges never register a touch at all.
+  // strip near the top (and likely the right) of the touch-sensitive area
+  // *in this orientation* (tft.setRotation(1) - see setup()). These points
+  // were tuned specifically against that dead zone; a setRotation(3)
+  // experiment moved the dead zone and broke them (both too-narrow and
+  // too-wide variants were tried and failed), so if the display orientation
+  // ever changes again, re-map the dead zone via the corner-tap diagnostic
+  // in my_touchpad_read()'s TAP/RAW TOUCH detected Serial prints rather than
+  // guessing new coordinates.
   const int32_t P1X = 70,  P1Y = 110;
   const int32_t P2X = 380, P2Y = 260;
   // If both taps land within this many raw units of each other, treat the
@@ -908,29 +917,77 @@ lv_obj_t * chat_response_label = nullptr;
 lv_obj_t * chat_kb = nullptr;
 lv_obj_t * chat_response_box = nullptr;
 lv_obj_t * chat_send_btn = nullptr;
+lv_obj_t * chat_back_btn = nullptr;
+lv_obj_t * chat_header_bar = nullptr;
+lv_obj_t * chat_time_label = nullptr;
+lv_obj_t * chat_wifi_label = nullptr;
 
-// Two layouts: "normal" (reply box + input row + Send button) and "typing"
-// (reply box hidden, input box moved to the very top and widened to fill
-// the space Send normally occupies - Send is hidden since the keyboard's
-// own Enter/checkmark key submits - and the keyboard fills essentially the
-// rest of the screen).
+// Refreshes the header's clock + WiFi status. Called on a timer and once
+// right after the header is built.
+void updateChatHeader(lv_timer_t *timer) {
+  if (!chat_time_label || !chat_wifi_label) return;
+
+  time_t now = time(nullptr);
+  if (now > 1000000000) { // NTP-synced (after year 2001)
+    struct tm *ti = localtime(&now);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02d:%02d", ti->tm_hour, ti->tm_min);
+    lv_label_set_text(chat_time_label, buf);
+  } else {
+    lv_label_set_text(chat_time_label, "--:--");
+  }
+
+  bool online = (WiFi.status() == WL_CONNECTED);
+  lv_label_set_text(chat_wifi_label, online ? LV_SYMBOL_WIFI " Online" : LV_SYMBOL_CLOSE " Offline");
+  lv_obj_set_style_text_color(chat_wifi_label, online ? lv_color_hex(0x22c55e) : lv_color_hex(0xef4444), 0);
+}
+
+// Two layouts: "normal" (header + reply box + input row + Send button) and
+// "typing" (header + reply box hidden, input box moved to the very top and
+// widened to fill the space Send normally occupies - Send is hidden since
+// the keyboard's own Enter/checkmark key submits - and the keyboard fills
+// essentially the rest of the screen).
 void setChatTypingMode(bool typing) {
   if (typing) {
+    lv_obj_add_flag(chat_header_bar, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(chat_response_box, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(chat_send_btn, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_size(chat_input_ta, 460, 40);
+    lv_obj_clear_flag(chat_back_btn, LV_OBJ_FLAG_HIDDEN);
+    // Input box is DISPLAY ONLY while typing (T9 writes into it directly -
+    // see t9KeypadEventCb - you never need to tap it here), so unlike the
+    // back button it's fine for it to sit up in the confirmed touch dead
+    // zone (y<110 - see runTouchCalibration()'s P1Y): big and visible at
+    // the top, full width.
+    lv_obj_set_size(chat_input_ta, 460, 100);
     lv_obj_align(chat_input_ta, LV_ALIGN_TOP_MID, 0, 8);
-    lv_obj_set_size(chat_kb, 460, 260);
-    lv_obj_align(chat_kb, LV_ALIGN_BOTTOM_MID, 0, -8);
+    // Back DOES need to be tappable, so it still can't go in the dead zone -
+    // but instead of its own horizontal row (which cost the keypad height),
+    // it's now a tall vertical strip beside the keypad, costing width
+    // instead. y=113 is the same dead-zone boundary as before; height=202
+    // now spans the FULL safe area down to y=315, all of which the keypad
+    // used to have to share with a separate back-button row.
+    lv_obj_set_size(chat_back_btn, 70, 202);
+    lv_obj_align(chat_back_btn, LV_ALIGN_TOP_RIGHT, -10, 113);
+    lv_obj_set_size(chat_kb, 380, 202);
+    lv_obj_align(chat_kb, LV_ALIGN_TOP_LEFT, 10, 113);
     lv_obj_clear_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
   } else {
+    lv_obj_clear_flag(chat_header_bar, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(chat_response_box, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(chat_send_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(chat_back_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_size(chat_input_ta, 340, 40);
     lv_obj_align(chat_input_ta, LV_ALIGN_TOP_LEFT, 10, 270);
     lv_obj_align(chat_send_btn, LV_ALIGN_TOP_RIGHT, -10, 270);
     lv_obj_add_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
   }
+}
+
+// Back-to-front-page button (typing mode only, to the left of the input
+// box): cancels typing without sending, just like defocusing used to before
+// that got tied to Send-only (see the note on chatTextareaEventCb).
+void backToChatBtnEventCb(lv_event_t *e) {
+  setChatTypingMode(false);
 }
 
 // Set once a conversation is underway; sending it back as
@@ -1035,22 +1092,101 @@ void sendChatMessage(lv_event_t *e) {
 
 // Show/hide the keyboard as the textarea gains/loses focus, and treat the
 // keyboard's Enter key the same as tapping Send.
+// The normal-mode button next to the input box: a keyboard icon that opens
+// typing mode (tapping the input box itself does the same via FOCUSED
+// below, this is just a more obviously-tappable/discoverable entry point).
+// Actually sending a message happens via the T9 keypad's own checkmark key.
+void openKeyboardBtnEventCb(lv_event_t *e) {
+  lv_obj_add_state(chat_input_ta, LV_STATE_FOCUSED); // so the cursor shows
+  setChatTypingMode(true);
+}
+
 void chatTextareaEventCb(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
   if (code == LV_EVENT_FOCUSED) {
     setChatTypingMode(true);
-  } else if (code == LV_EVENT_DEFOCUSED) {
-    setChatTypingMode(false);
   }
+  // Deliberately NOT reacting to LV_EVENT_DEFOCUSED here: tapping any T9
+  // key on the keypad shifts LVGL's focus away from this textarea too,
+  // which fired this same event and exited typing mode on every keypress
+  // instead of only on Send. Typing mode now only ends via sendChatMessage()
+  // (Send button or the T9 keypad's Send/checkmark key).
 }
 
-void chatKeyboardEventCb(lv_event_t *e) {
-  lv_event_code_t code = lv_event_get_code(e);
-  if (code == LV_EVENT_READY) { // Enter/checkmark key
-    sendChatMessage(e);
-  } else if (code == LV_EVENT_CANCEL) { // hide/close key
-    setChatTypingMode(false);
+// ---------------------------------------------------------------------------
+// T9-style multi-tap keypad (old feature-phone style): a 4x3 grid instead of
+// a QWERTY layout, so each button is huge (~153x65px vs ~40-90px on the
+// QWERTY attempts before this). Built on a plain lv_btnmatrix rather than
+// lv_keyboard - lv_keyboard always inserts a button's literal label text
+// into the bound textarea on click, which can't express "tap twice quickly
+// to cycle to the next letter", so button presses are handled entirely by
+// hand in t9KeypadEventCb() below instead.
+// ---------------------------------------------------------------------------
+
+// Grid order: 1 2 3 / 4 5 6 / 7 8 9 / <BACKSPACE> 0 <SEND>. Each entry is
+// every character that digit's key cycles through on repeated taps within
+// T9_CYCLE_TIMEOUT_MS (last char in each string is the digit itself, so you
+// can still reach a literal digit by tapping through the whole cycle).
+// NULL entries (backspace/send) are handled as special cases, not cycled.
+static const char * T9_CYCLES[12] = {
+  ".,!?1", "abc2", "def3",
+  "ghi4",  "jkl5", "mno6",
+  "pqrs7", "tuv8", "wxyz9",
+  NULL,    " 0",   NULL,
+};
+static const int T9_BACKSPACE_IDX = 9;
+static const int T9_SEND_IDX = 11;
+static const uint32_t T9_CYCLE_TIMEOUT_MS = 600;
+
+// Each button shows its digit and letters on two lines, e.g. "2\nabc" -
+// safe to embed a literal newline inside a label like this because
+// lv_btnmatrix only treats an array element that IS "\n" (via strcmp) as a
+// row break, not one that merely contains one (confirmed in lv_btnmatrix.c).
+static const char * chat_t9_map[] = {
+  "1\n.,!?", "2\nabc", "3\ndef", "\n",
+  "4\nghi",  "5\njkl", "6\nmno", "\n",
+  "7\npqrs", "8\ntuv", "9\nwxyz", "\n",
+  LV_SYMBOL_BACKSPACE, "0\n_", LV_SYMBOL_OK, "",
+};
+
+int g_t9LastBtnIdx = -1;
+int g_t9CyclePos = 0;
+uint32_t g_t9LastPressMs = 0;
+
+void t9KeypadEventCb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  lv_obj_t *btnm = lv_event_get_target(e);
+  uint16_t idx = lv_btnmatrix_get_selected_btn(btnm);
+  if (idx == LV_BTNMATRIX_BTN_NONE) return;
+
+  if (idx == T9_BACKSPACE_IDX) {
+    lv_textarea_del_char(chat_input_ta);
+    g_t9LastBtnIdx = -1;
+    return;
   }
+  if (idx == T9_SEND_IDX) {
+    g_t9LastBtnIdx = -1;
+    sendChatMessage(NULL);
+    return;
+  }
+
+  const char *cycle = T9_CYCLES[idx];
+  if (!cycle) return;
+  int cycleLen = (int)strlen(cycle);
+
+  uint32_t now = millis();
+  bool cyclingSameKey = (idx == g_t9LastBtnIdx) && (now - g_t9LastPressMs < T9_CYCLE_TIMEOUT_MS);
+
+  if (cyclingSameKey) {
+    lv_textarea_del_char(chat_input_ta); // replace the last candidate letter
+    g_t9CyclePos = (g_t9CyclePos + 1) % cycleLen;
+  } else {
+    g_t9CyclePos = 0; // different key, or timed out - start a new letter
+  }
+
+  lv_textarea_add_char(chat_input_ta, cycle[g_t9CyclePos]);
+  g_t9LastBtnIdx = idx;
+  g_t9LastPressMs = now;
 }
 
 // Builds the entire (only) screen: reply area on top, input box + Send
@@ -1060,12 +1196,43 @@ void createChatScreen() {
   lv_obj_clean(lv_scr_act());
   lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x0f172a), 0);
 
-  // Reply area - fills essentially the whole screen (input row is pinned to
-  // the bottom below it). Hidden while typing (see setChatTypingMode) so
-  // the input box + keyboard can take over instead.
+  // Header bar: clock, title, WiFi status (replaces a battery indicator -
+  // this board has no battery). Hidden while typing to reclaim space for
+  // the input box + keyboard.
+  chat_header_bar = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(chat_header_bar, 480, 28);
+  lv_obj_set_pos(chat_header_bar, 0, 0);
+  lv_obj_set_style_bg_color(chat_header_bar, lv_color_hex(0x0f172a), 0);
+  lv_obj_set_style_border_width(chat_header_bar, 0, 0);
+  lv_obj_set_style_radius(chat_header_bar, 0, 0);
+  lv_obj_clear_flag(chat_header_bar, LV_OBJ_FLAG_SCROLLABLE);
+
+  chat_time_label = lv_label_create(chat_header_bar);
+  lv_label_set_text(chat_time_label, "--:--");
+  lv_obj_set_style_text_color(chat_time_label, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_font(chat_time_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(chat_time_label, LV_ALIGN_LEFT_MID, 8, 0);
+
+  lv_obj_t *title_label = lv_label_create(chat_header_bar);
+  lv_label_set_text(title_label, "AI Assistant");
+  lv_obj_set_style_text_color(title_label, lv_color_hex(0x22c55e), 0);
+  lv_obj_set_style_text_font(title_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(title_label, LV_ALIGN_CENTER, 0, 0);
+
+  chat_wifi_label = lv_label_create(chat_header_bar);
+  lv_label_set_text(chat_wifi_label, LV_SYMBOL_CLOSE " Offline");
+  lv_obj_set_style_text_font(chat_wifi_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(chat_wifi_label, LV_ALIGN_RIGHT_MID, -8, 0);
+
+  updateChatHeader(NULL);                            // paint real state immediately
+  lv_timer_create(updateChatHeader, 2000, NULL);      // then keep it fresh
+
+  // Reply area - fills essentially the rest of the screen (input row is
+  // pinned to the bottom below it). Hidden while typing (see
+  // setChatTypingMode) so the input box + keyboard can take over instead.
   chat_response_box = lv_obj_create(lv_scr_act());
-  lv_obj_set_size(chat_response_box, 460, 255);
-  lv_obj_align(chat_response_box, LV_ALIGN_TOP_MID, 0, 5);
+  lv_obj_set_size(chat_response_box, 460, 227);
+  lv_obj_align(chat_response_box, LV_ALIGN_TOP_MID, 0, 33);
   lv_obj_set_style_bg_color(chat_response_box, lv_color_hex(0x1e293b), 0);
   lv_obj_set_style_border_width(chat_response_box, 1, 0);
   lv_obj_set_style_border_color(chat_response_box, lv_color_hex(0x334155), 0);
@@ -1078,6 +1245,20 @@ void createChatScreen() {
   lv_obj_set_style_text_color(chat_response_label, lv_color_hex(0xffffff), 0);
   lv_obj_set_style_text_font(chat_response_label, &lv_font_montserrat_14, 0);
   lv_obj_align(chat_response_label, LV_ALIGN_TOP_LEFT, 5, 5);
+
+  // Back-to-front button (typing mode only - hidden here, shown by
+  // setChatTypingMode). Sits to the left of the input box.
+  chat_back_btn = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(chat_back_btn, 70, 202); // tall vertical strip beside the keypad, not a row above it
+  lv_obj_align(chat_back_btn, LV_ALIGN_TOP_RIGHT, -10, 113);
+  lv_obj_add_event_cb(chat_back_btn, backToChatBtnEventCb, LV_EVENT_CLICKED, NULL);
+  lv_obj_set_style_radius(chat_back_btn, 16, 0);
+  lv_obj_set_style_bg_color(chat_back_btn, lv_color_hex(0x334155), 0);
+  lv_obj_t *back_label = lv_label_create(chat_back_btn);
+  lv_label_set_text(back_label, LV_SYMBOL_LEFT "\nBack"); // two lines - fits a tall narrow button
+  lv_obj_set_style_text_align(back_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_center(back_label);
+  lv_obj_add_flag(chat_back_btn, LV_OBJ_FLAG_HIDDEN);
 
   // Input row: textarea + Send button
   chat_input_ta = lv_textarea_create(lv_scr_act());
@@ -1095,23 +1276,35 @@ void createChatScreen() {
   chat_send_btn = lv_btn_create(lv_scr_act());
   lv_obj_set_size(chat_send_btn, 100, 40);
   lv_obj_align(chat_send_btn, LV_ALIGN_TOP_RIGHT, -10, 270);
-  lv_obj_add_event_cb(chat_send_btn, sendChatMessage, LV_EVENT_CLICKED, NULL);
+  lv_obj_add_event_cb(chat_send_btn, openKeyboardBtnEventCb, LV_EVENT_CLICKED, NULL);
   lv_obj_set_style_radius(chat_send_btn, 16, 0);
+  lv_obj_set_style_bg_color(chat_send_btn, lv_color_hex(0x22c55e), 0); // match the green accent theme
   lv_obj_t *send_label = lv_label_create(chat_send_btn);
-  lv_label_set_text(send_label, "Send");
+  lv_label_set_text(send_label, LV_SYMBOL_KEYBOARD);
   lv_obj_center(send_label);
 
-  // Keyboard, hidden until the textarea is focused. setChatTypingMode()
+  // T9 keypad, hidden until the textarea is focused. setChatTypingMode()
   // resizes/repositions it (and the input row) each time it's shown/hidden.
-  // Styled as a rounded bordered "card" to match the input box.
-  chat_kb = lv_keyboard_create(lv_scr_act());
-  lv_keyboard_set_textarea(chat_kb, chat_input_ta);
-  lv_obj_add_event_cb(chat_kb, chatKeyboardEventCb, LV_EVENT_ALL, NULL);
-  lv_obj_set_style_radius(chat_kb, 16, 0);
-  lv_obj_set_style_border_width(chat_kb, 2, 0);
-  lv_obj_set_style_border_color(chat_kb, lv_color_hex(0x22c55e), 0);
-  lv_obj_set_style_bg_color(chat_kb, lv_color_hex(0x0f172a), 0);
-  lv_obj_set_style_pad_all(chat_kb, 8, 0);
+  // Styled as a rounded bordered "card" to match the input box. A plain
+  // lv_btnmatrix, not lv_keyboard - see t9KeypadEventCb() for why.
+  chat_kb = lv_btnmatrix_create(lv_scr_act());
+  lv_btnmatrix_set_map(chat_kb, chat_t9_map);
+  lv_obj_add_event_cb(chat_kb, t9KeypadEventCb, LV_EVENT_VALUE_CHANGED, NULL);
+  // Outer "card" background - transparent/borderless so only the individual
+  // key outlines below show, matching the reference (each key has its own
+  // outline on a plain dark background, not one big bordered box).
+  lv_obj_set_style_bg_opa(chat_kb, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(chat_kb, 0, 0);
+  lv_obj_set_style_pad_all(chat_kb, 4, 0);
+  lv_obj_set_style_pad_row(chat_kb, 6, 0);
+  lv_obj_set_style_pad_column(chat_kb, 6, 0);
+  // Per-key styling (LV_PART_ITEMS = the individual buttons, not the
+  // container) - dark fill, thin green outline, rounded corners.
+  lv_obj_set_style_radius(chat_kb, 10, LV_PART_ITEMS);
+  lv_obj_set_style_bg_color(chat_kb, lv_color_hex(0x1e293b), LV_PART_ITEMS);
+  lv_obj_set_style_border_width(chat_kb, 1, LV_PART_ITEMS);
+  lv_obj_set_style_border_color(chat_kb, lv_color_hex(0x22c55e), LV_PART_ITEMS);
+  lv_obj_set_style_text_color(chat_kb, lv_color_hex(0xffffff), LV_PART_ITEMS);
   lv_obj_add_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -1245,7 +1438,21 @@ void setup()
 { 
   Serial.begin( 115200 ); /*初始化串口*/
   Serial.println("Starting ESP32-3248S035 IP Display...");
-  
+
+  // TEMP/DEBUG: print why the chip actually reset. A "hang" that's really a
+  // crash/watchdog-triggered reboot loop looks identical to the user (screen
+  // just seems stuck/restarts), but this tells us which it was.
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  Serial.println("Reset reason: POWERON (normal power-on)"); break;
+    case ESP_RST_SW:       Serial.println("Reset reason: SW (esp_restart() called)"); break;
+    case ESP_RST_PANIC:    Serial.println("Reset reason: PANIC - crashed last boot!"); break;
+    case ESP_RST_INT_WDT:  Serial.println("Reset reason: INT_WDT - interrupt watchdog!"); break;
+    case ESP_RST_TASK_WDT: Serial.println("Reset reason: TASK_WDT - code hung last boot!"); break;
+    case ESP_RST_WDT:      Serial.println("Reset reason: WDT - other watchdog reset!"); break;
+    case ESP_RST_BROWNOUT: Serial.println("Reset reason: BROWNOUT - power dipped!"); break;
+    default:                Serial.printf("Reset reason: %d (see esp_reset_reason_t)\r\n", (int)esp_reset_reason()); break;
+  }
+
   // Initialize GT911 touch
   gt911_int_();
   
@@ -1259,16 +1466,8 @@ void setup()
   // Initialize TFT
   tft.begin();          /*初始化*/
   tft.setRotation(1);    /* 旋转 - Landscape mode */
-  tft.fillScreen(TFT_RED);
-  delay(500);
-  tft.fillScreen(TFT_GREEN);
-  delay(500);
-  tft.fillScreen(TFT_BLUE);
-  delay(500);
   tft.fillScreen(TFT_BLACK);
-  tft.drawRect(0, 0, 480, 320, TFT_RED);
-  delay(500);
-  
+
   // Initialize LVGL display buffer
   lv_disp_draw_buf_init( &draw_buf, buf, NULL, screenWidth * 10 );
   
