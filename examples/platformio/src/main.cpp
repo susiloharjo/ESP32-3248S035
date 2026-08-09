@@ -906,8 +906,42 @@ void connectToWiFi() {
 lv_obj_t * chat_input_ta = nullptr;
 lv_obj_t * chat_response_label = nullptr;
 lv_obj_t * chat_kb = nullptr;
+lv_obj_t * chat_response_box = nullptr;
+lv_obj_t * chat_send_btn = nullptr;
 
-// Ask Gemini `prompt` and return its reply text (or an error string).
+// Two layouts: "normal" (reply box + input row + Send button) and "typing"
+// (reply box hidden, input box moved to the very top and widened to fill
+// the space Send normally occupies - Send is hidden since the keyboard's
+// own Enter/checkmark key submits - and the keyboard fills essentially the
+// rest of the screen).
+void setChatTypingMode(bool typing) {
+  if (typing) {
+    lv_obj_add_flag(chat_response_box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(chat_send_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_size(chat_input_ta, 460, 40);
+    lv_obj_align(chat_input_ta, LV_ALIGN_TOP_MID, 0, 8);
+    lv_obj_set_size(chat_kb, 460, 260);
+    lv_obj_align(chat_kb, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_clear_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_clear_flag(chat_response_box, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(chat_send_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_size(chat_input_ta, 340, 40);
+    lv_obj_align(chat_input_ta, LV_ALIGN_TOP_LEFT, 10, 270);
+    lv_obj_align(chat_send_btn, LV_ALIGN_TOP_RIGHT, -10, 270);
+    lv_obj_add_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+// Set once a conversation is underway; sending it back as
+// previous_interaction_id tells Gemini's Interactions API to continue from
+// that point using history it already has server-side, so the ESP32 never
+// has to store/resend the growing conversation itself (crucial on 320KB of
+// RAM - a client-side "contents" history array would eventually blow that).
+String g_previousInteractionId = "";
+
+// Ask Gemini `prompt` (continuing the running conversation, if any) and
+// return its reply text (or an error string).
 String queryGemini(const String &prompt) {
   if (WiFi.status() != WL_CONNECTED) {
     return "No WiFi connection";
@@ -915,16 +949,23 @@ String queryGemini(const String &prompt) {
 
   WiFiClientSecure client;
   client.setInsecure(); // skip TLS cert validation - acceptable for a hobby project
+  client.setTimeout(20000); // ms - TLS handshake alone can take a few sec on ESP32
 
   HTTPClient http;
-  const String url =
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent";
+  const String url = "https://generativelanguage.googleapis.com/v1beta/interactions";
   http.begin(client, url);
+  http.setTimeout(20000);        // ms - default is too short for Gemini's response time
+  http.setConnectTimeout(20000); // ms
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-goog-api-key", GEMINI_API_KEY);
+  http.addHeader("Api-Revision", "2026-05-20"); // per Gemini's Interactions API quickstart
 
   JsonDocument reqDoc;
-  reqDoc["contents"][0]["parts"][0]["text"] = prompt;
+  reqDoc["model"] = "gemini-flash-latest";
+  reqDoc["input"] = prompt;
+  if (g_previousInteractionId.length() > 0) {
+    reqDoc["previous_interaction_id"] = g_previousInteractionId;
+  }
   String reqBody;
   serializeJson(reqDoc, reqBody);
 
@@ -934,16 +975,34 @@ String queryGemini(const String &prompt) {
   if (httpCode == HTTP_CODE_OK) {
     String payload = http.getString();
 
-    // Only keep the field we actually need - keeps parsing cheap on 320KB RAM.
+    // Only keep the fields we actually need - keeps parsing cheap on 320KB
+    // RAM. "steps" is an array of {type, content:[{type,text}]} entries
+    // (user_input, model_output, ...); index 0 is ArduinoJson's filter
+    // template applied to every array element, not "only element 0".
     JsonDocument filter;
-    filter["candidates"][0]["content"]["parts"][0]["text"] = true;
+    filter["id"] = true;
+    filter["steps"][0]["type"] = true;
+    filter["steps"][0]["content"][0]["type"] = true;
+    filter["steps"][0]["content"][0]["text"] = true;
 
     JsonDocument doc;
     DeserializationError err =
         deserializeJson(doc, payload, DeserializationOption::Filter(filter));
     if (!err) {
-      const char *text = doc["candidates"][0]["content"]["parts"][0]["text"];
-      if (text) result = String(text);
+      const char *newId = doc["id"];
+      if (newId) g_previousInteractionId = String(newId);
+
+      for (JsonObject step : doc["steps"].as<JsonArray>()) {
+        const char *stepType = step["type"];
+        if (!stepType || strcmp(stepType, "model_output") != 0) continue;
+        for (JsonObject part : step["content"].as<JsonArray>()) {
+          const char *partType = part["type"];
+          if (partType && strcmp(partType, "text") == 0) {
+            const char *text = part["text"];
+            if (text) result = String(text);
+          }
+        }
+      }
     } else {
       result = "Parse error";
       Serial.println(err.c_str());
@@ -964,8 +1023,8 @@ void sendChatMessage(lv_event_t *e) {
   if (strlen(prompt) == 0) return;
 
   String promptCopy = prompt; // queryGemini() clears the textarea below
+  setChatTypingMode(false); // reveal the reply box + hide keyboard again
   lv_label_set_text(chat_response_label, "Thinking...");
-  lv_obj_add_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
   lv_refr_now(NULL); // paint "Thinking..." before the blocking HTTP call
 
   String reply = queryGemini(promptCopy);
@@ -979,9 +1038,9 @@ void sendChatMessage(lv_event_t *e) {
 void chatTextareaEventCb(lv_event_t *e) {
   lv_event_code_t code = lv_event_get_code(e);
   if (code == LV_EVENT_FOCUSED) {
-    lv_obj_clear_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
+    setChatTypingMode(true);
   } else if (code == LV_EVENT_DEFOCUSED) {
-    lv_obj_add_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
+    setChatTypingMode(false);
   }
 }
 
@@ -990,7 +1049,7 @@ void chatKeyboardEventCb(lv_event_t *e) {
   if (code == LV_EVENT_READY) { // Enter/checkmark key
     sendChatMessage(e);
   } else if (code == LV_EVENT_CANCEL) { // hide/close key
-    lv_obj_add_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
+    setChatTypingMode(false);
   }
 }
 
@@ -1001,17 +1060,18 @@ void createChatScreen() {
   lv_obj_clean(lv_scr_act());
   lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x0f172a), 0);
 
-  // Reply area - kept compact so the keyboard below can be as large as
-  // possible (bigger keys = easier to hit accurately on this panel).
-  lv_obj_t *response_box = lv_obj_create(lv_scr_act());
-  lv_obj_set_size(response_box, 460, 95);
-  lv_obj_align(response_box, LV_ALIGN_TOP_MID, 0, 5);
-  lv_obj_set_style_bg_color(response_box, lv_color_hex(0x1e293b), 0);
-  lv_obj_set_style_border_width(response_box, 1, 0);
-  lv_obj_set_style_border_color(response_box, lv_color_hex(0x334155), 0);
-  lv_obj_set_style_radius(response_box, 8, 0);
+  // Reply area - fills essentially the whole screen (input row is pinned to
+  // the bottom below it). Hidden while typing (see setChatTypingMode) so
+  // the input box + keyboard can take over instead.
+  chat_response_box = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(chat_response_box, 460, 255);
+  lv_obj_align(chat_response_box, LV_ALIGN_TOP_MID, 0, 5);
+  lv_obj_set_style_bg_color(chat_response_box, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(chat_response_box, 1, 0);
+  lv_obj_set_style_border_color(chat_response_box, lv_color_hex(0x334155), 0);
+  lv_obj_set_style_radius(chat_response_box, 8, 0);
 
-  chat_response_label = lv_label_create(response_box);
+  chat_response_label = lv_label_create(chat_response_box);
   lv_label_set_long_mode(chat_response_label, LV_LABEL_LONG_WRAP);
   lv_obj_set_width(chat_response_label, 430);
   lv_label_set_text(chat_response_label, "Ask me anything!");
@@ -1021,27 +1081,37 @@ void createChatScreen() {
 
   // Input row: textarea + Send button
   chat_input_ta = lv_textarea_create(lv_scr_act());
-  lv_obj_set_size(chat_input_ta, 340, 35);
-  lv_obj_align(chat_input_ta, LV_ALIGN_TOP_LEFT, 10, 105);
+  lv_obj_set_size(chat_input_ta, 340, 40);
+  lv_obj_align(chat_input_ta, LV_ALIGN_TOP_LEFT, 10, 270);
   lv_textarea_set_one_line(chat_input_ta, true);
   lv_textarea_set_placeholder_text(chat_input_ta, "Type a message...");
   lv_obj_add_event_cb(chat_input_ta, chatTextareaEventCb, LV_EVENT_ALL, NULL);
+  lv_obj_set_style_radius(chat_input_ta, 16, 0);
+  lv_obj_set_style_border_width(chat_input_ta, 2, 0);
+  lv_obj_set_style_border_color(chat_input_ta, lv_color_hex(0x22c55e), 0);
+  lv_obj_set_style_bg_color(chat_input_ta, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_text_color(chat_input_ta, lv_color_hex(0xffffff), 0);
 
-  lv_obj_t *send_btn = lv_btn_create(lv_scr_act());
-  lv_obj_set_size(send_btn, 100, 35);
-  lv_obj_align(send_btn, LV_ALIGN_TOP_RIGHT, -10, 105);
-  lv_obj_add_event_cb(send_btn, sendChatMessage, LV_EVENT_CLICKED, NULL);
-  lv_obj_t *send_label = lv_label_create(send_btn);
+  chat_send_btn = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(chat_send_btn, 100, 40);
+  lv_obj_align(chat_send_btn, LV_ALIGN_TOP_RIGHT, -10, 270);
+  lv_obj_add_event_cb(chat_send_btn, sendChatMessage, LV_EVENT_CLICKED, NULL);
+  lv_obj_set_style_radius(chat_send_btn, 16, 0);
+  lv_obj_t *send_label = lv_label_create(chat_send_btn);
   lv_label_set_text(send_label, "Send");
   lv_obj_center(send_label);
 
-  // Keyboard, hidden until the textarea is focused. Fills the rest of the
-  // screen (175px tall vs the original 110px) for bigger, easier-to-hit keys.
+  // Keyboard, hidden until the textarea is focused. setChatTypingMode()
+  // resizes/repositions it (and the input row) each time it's shown/hidden.
+  // Styled as a rounded bordered "card" to match the input box.
   chat_kb = lv_keyboard_create(lv_scr_act());
   lv_keyboard_set_textarea(chat_kb, chat_input_ta);
-  lv_obj_set_size(chat_kb, 480, 175);
-  lv_obj_align(chat_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_obj_add_event_cb(chat_kb, chatKeyboardEventCb, LV_EVENT_ALL, NULL);
+  lv_obj_set_style_radius(chat_kb, 16, 0);
+  lv_obj_set_style_border_width(chat_kb, 2, 0);
+  lv_obj_set_style_border_color(chat_kb, lv_color_hex(0x22c55e), 0);
+  lv_obj_set_style_bg_color(chat_kb, lv_color_hex(0x0f172a), 0);
+  lv_obj_set_style_pad_all(chat_kb, 8, 0);
   lv_obj_add_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -1231,17 +1301,25 @@ void setup()
   lv_refr_now(NULL);
   Serial.println("Initial display created");
   
-  // Try to connect to WiFi (non-blocking)
+  // connectToWiFi() blocks for several seconds (network scan + connect
+  // attempts) with no screen updates of its own, which can look like the
+  // device hung right after calibration. Show status on the chat screen
+  // (already visible at this point) so it's clear something's happening.
+  lv_label_set_text(chat_response_label, "Connecting to WiFi...");
+  lv_refr_now(NULL);
   Serial.println("Connecting to WiFi...");
   connectToWiFi();
-  
+
   // Configure time only if WiFi is connected
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("Configuring time...");
     configTime(GMT_OFFSET, DAYLIGHT_OFFSET, NTP_SERVER);
+    lv_label_set_text(chat_response_label, "Connected! Ask me anything.");
   } else {
     Serial.println("No WiFi - running in offline mode");
+    lv_label_set_text(chat_response_label, "No WiFi - couldn't reach Gemini. Ask me anything once connected.");
   }
+  lv_refr_now(NULL);
   
   Serial.println( "Setup done - IP Display should be running" );
 }
