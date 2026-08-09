@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <time.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -8,6 +9,8 @@
 #include <TFT_eSPI.h>
 
 #include <demos/lv_demos.h>
+
+#include "secrets.h"
 //********************************************************************************************//
 /*******************************************************************************
    End of Arduino_GFX setting
@@ -302,7 +305,8 @@ void GT911_Scan(void)
     {
       touched = 0;
       GT911_WR_Reg(GT911_READ_XY_REG, (uint8_t *)&Clearbuf, 1);
-      Serial.printf("No touch\r\n");
+      // Serial.printf("No touch\r\n"); // silenced: this fires ~100x/sec and
+      // drowns out the touch-calibration diagnostic prints below.
       delay(10);
     }
     else
@@ -497,24 +501,164 @@ void GT911_Int()
 
 /*Read the touchpad*/
 
+// GT911 reports raw touch coordinates in the panel's native PORTRAIT
+// orientation, but the display runs in LANDSCAPE (tft.setRotation(1),
+// 480x320 - see setup()), so raw X/Y must be swapped and rescaled to match
+// what's drawn on screen: screenX = f(rawY), screenY = f(rawX) (90 deg
+// rotation, confirmed on-device - no extra axis flip needed).
+//
+// The scale/offset for that mapping is NOT a fixed constant - it's derived
+// at boot by runTouchCalibration() (see below), which shows two on-screen
+// targets and captures the actual raw reading at each tap. That replaces
+// guessing the raw range from manually-reported corner taps, which was
+// fragile (small panel, hard to reach the literal physical edge, and a
+// linear stretch amplifies any imprecision in those reference points).
+struct TouchCalib {
+  float scaleX = 1, offsetX = 0; // screenX = rawY * scaleX + offsetX
+  float scaleY = 1, offsetY = 0; // screenY = rawX * scaleY + offsetY
+};
+TouchCalib g_touchCalib;
+
+// Raw GT911 reading, no screen-coordinate transform - used both by the
+// calibration routine and (after transform) by my_touchpad_read() below.
+bool readRawTouch(int32_t &rawX, int32_t &rawY) {
+  GT911_Scan();
+  if (!touched) return false;
+  rawX = Dev_Now.X[0];
+  rawY = Dev_Now.Y[0];
+  Serial.printf("RAW TOUCH detected: x:%d y:%d\r\n", rawX, rawY); // TEMP/DEBUG
+  return true;
+}
+
   void my_touchpad_read( lv_indev_drv_t * indev_driver, lv_indev_data_t * data )
   {
-  uint16_t touchX, touchY;
-
-  //bool touched = tft.getTouch( &touchX, &touchY, 600 );
-  GT911_Scan();
-  if ( !touched )
+  int32_t rawX, rawY;
+  if ( !readRawTouch(rawX, rawY) )
   {
     data->state = LV_INDEV_STATE_REL;
   }
   else
   {
-    /*Set the coordinates*/
-    data->point.x = Dev_Now.X[0];
-    data->point.y = Dev_Now.Y[0];
-    //Serial.printf("touch:%d, x_in:%d, y_in:%d, x_out:%d, y_out:%d\r\n", touched, Dev_Now.X[0], Dev_Now.Y[0], data->point.x, data->point.y);
-        data->state = LV_INDEV_STATE_PR;
+    int32_t screenX = (int32_t)(rawY * g_touchCalib.scaleX + g_touchCalib.offsetX);
+    int32_t screenY = (int32_t)(rawX * g_touchCalib.scaleY + g_touchCalib.offsetY);
+
+    // Clamp in case a touch falls outside the calibrated range
+    if (screenX < 0) screenX = 0;
+    if (screenX > 479) screenX = 479;
+    if (screenY < 0) screenY = 0;
+    if (screenY > 319) screenY = 319;
+
+    data->point.x = screenX;
+    data->point.y = screenY;
+    data->state = LV_INDEV_STATE_PR;
+
+    static uint32_t lastLog = 0; // TEMP/DEBUG: throttle to ~10/sec, still readable
+    if (millis() - lastLog > 100) {
+      Serial.printf("TAP screen x:%d y:%d (raw x:%d y:%d)\r\n", screenX, screenY, rawX, rawY);
+      lastLog = millis();
+    }
   }
+}
+
+// Waits for any already-in-progress touch to release, then waits for and
+// returns the raw coordinates of the next fresh tap. Keeps LVGL painting
+// (lv_timer_handler) so the calibration target stays visible while blocked.
+void waitForRawTap(int32_t &rawX, int32_t &rawY) {
+  int32_t x, y;
+  // NOTE: deliberately does NOT call lv_timer_handler() here - that would
+  // also trigger the indev's own GT911_Scan() via my_touchpad_read() in the
+  // background, racing with these direct reads (GT911_Scan() clears the
+  // "data ready" flag on every read, so two independent pollers can each
+  // clear the flag out from under the other and miss the tap entirely).
+  // The target is already drawn before this is called, so no redraw is
+  // needed while waiting.
+  while (readRawTouch(x, y)) { delay(5); }
+
+  uint32_t lastBeat = millis(); // TEMP/DEBUG heartbeat, proves we're not hung
+  while (!readRawTouch(rawX, rawY)) {
+    delay(5);
+    if (millis() - lastBeat > 1000) {
+      Serial.println("...waiting for tap...");
+      lastBeat = millis();
+    }
+  }
+  delay(30); // let the reading settle
+  readRawTouch(rawX, rawY);
+}
+
+// Shows two on-screen targets, captures the real raw touch at each, and
+// derives g_touchCalib from those two points. Run once at boot before the
+// chat UI is built.
+void runTouchCalibration() {
+  lv_obj_clean(lv_scr_act());
+  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x0f172a), 0);
+
+  lv_obj_t *label = lv_label_create(lv_scr_act());
+  lv_label_set_text(label, "Tap the red dot");
+  lv_obj_set_style_text_color(label, lv_color_hex(0xffffff), 0);
+  lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 10);
+
+  lv_obj_t *target = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(target, 20, 20);
+  lv_obj_set_style_radius(target, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(target, lv_color_hex(0xff0000), 0);
+  lv_obj_set_style_border_width(target, 0, 0);
+  lv_obj_clear_flag(target, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(target, LV_OBJ_FLAG_CLICKABLE);
+
+  // Pulled well clear of the true edges - on-device testing found a dead
+  // strip near the top (and likely the right) of the touch-sensitive area,
+  // so points too close to those edges never register a touch at all.
+  const int32_t P1X = 70,  P1Y = 110;
+  const int32_t P2X = 380, P2Y = 260;
+  // If both taps land within this many raw units of each other, treat the
+  // attempt as a mis-tap (e.g. user tapped point 2 before noticing it moved,
+  // reusing point 1's position) and retry rather than divide-by-near-zero
+  // into an inf/-inf scale that clamps every touch to one screen corner.
+  const int32_t MIN_RAW_SEPARATION = 20;
+
+  int32_t r1x, r1y, r2x, r2y;
+  for (;;) {
+    lv_label_set_text(label, "Tap the red dot (1/2)");
+    lv_obj_set_style_bg_color(target, lv_color_hex(0xff0000), 0);
+    lv_obj_set_pos(target, P1X - 10, P1Y - 10);
+    lv_obj_clear_flag(target, LV_OBJ_FLAG_HIDDEN);
+    lv_refr_now(NULL);
+    waitForRawTap(r1x, r1y);
+
+    // Force the user to actually see the dot move before tapping again -
+    // also gives a still-touching finger time to lift.
+    lv_label_set_text(label, "Good! Now tap the dot (2/2)");
+    lv_obj_set_style_bg_color(target, lv_color_hex(0x22c55e), 0);
+    lv_obj_set_pos(target, P2X - 10, P2Y - 10);
+    lv_refr_now(NULL);
+    delay(600);
+    waitForRawTap(r2x, r2y);
+
+    if (abs(r2x - r1x) >= MIN_RAW_SEPARATION && abs(r2y - r1y) >= MIN_RAW_SEPARATION) {
+      break; // good calibration data, proceed
+    }
+    Serial.printf("Calibration taps too close (r1=%d,%d r2=%d,%d) - retrying\r\n",
+                  r1x, r1y, r2x, r2y);
+    lv_label_set_text(label, "Too close together - try again");
+    lv_obj_set_style_bg_color(target, lv_color_hex(0xff0000), 0);
+    lv_refr_now(NULL);
+    delay(1200);
+  }
+
+  g_touchCalib.scaleX = (float)(P2X - P1X) / (float)(r2y - r1y);
+  g_touchCalib.offsetX = P1X - r1y * g_touchCalib.scaleX;
+  g_touchCalib.scaleY = (float)(P2Y - P1Y) / (float)(r2x - r1x);
+  g_touchCalib.offsetY = P1Y - r1x * g_touchCalib.scaleY;
+
+  Serial.printf("Touch calibrated: scaleX=%.4f offsetX=%.2f scaleY=%.4f offsetY=%.2f\r\n",
+                g_touchCalib.scaleX, g_touchCalib.offsetX,
+                g_touchCalib.scaleY, g_touchCalib.offsetY);
+
+  lv_label_set_text(label, "Calibrated!");
+  lv_obj_add_flag(target, LV_OBJ_FLAG_HIDDEN);
+  lv_refr_now(NULL);
+  delay(400);
 }
 //*****************************************************************************************************//
 
@@ -527,53 +671,13 @@ static lv_color_t buf[screenWidth * 10];
 
 TFT_eSPI tft = TFT_eSPI(); /* TFT实例 */
 
-// WiFi Configuration
-const char* WIFI_SSID = "wifilab";
-const char* WIFI_PASSWORD = "pradipa.1";
+// WiFi / weather / Gemini credentials live in secrets.h (gitignored) — see
+// secrets.example.h for the template.
 
 // NTP Configuration
 const char* NTP_SERVER = "pool.ntp.org";
 const long GMT_OFFSET = 7 * 3600; // GMT+7 (Indonesia)
 const int DAYLIGHT_OFFSET = 0;
-
-// Weather Configuration
-const char* WEATHER_API_KEY = "85c6d3d4179e4f92a2b7eaf04d7a104e"; // openweathermap.org
-const char* WEATHER_CITY = "Jakarta"; // Your city
-const char* WEATHER_COUNTRY = "ID"; // Your country code
-
-// LVGL Display Objects
-lv_obj_t * ip_label;
-lv_obj_t * time_label;
-lv_obj_t * date_label;
-lv_timer_t * update_timer;
-
-// Weather Display Objects
-lv_obj_t * weather_temp_label;
-lv_obj_t * weather_desc_label;
-lv_obj_t * weather_humidity_label;
-lv_obj_t * weather_pressure_label;
-lv_timer_t * weather_timer;
-
-// Dashboard Display Objects
-lv_obj_t * dashboard_time_label;
-lv_obj_t * dashboard_date_label;
-lv_obj_t * dashboard_location_label;
-lv_obj_t * dashboard_weather_temp_label;
-lv_obj_t * dashboard_weather_desc_label;
-lv_obj_t * dashboard_weather_icon;
-lv_obj_t * dashboard_forecast_labels[3];
-lv_obj_t * dashboard_room_temp_label;
-lv_obj_t * dashboard_humidity_label;
-lv_obj_t * dashboard_set_temp_label;
-lv_obj_t * dashboard_greeting_label;
-lv_obj_t * dashboard_avatar;
-lv_obj_t * dashboard_wifi_icon;
-lv_obj_t * dashboard_battery_label;
-lv_timer_t * dashboard_timer;
-
-// Screen mode - only dashboard
-enum ScreenMode { DASHBOARD_SCREEN };
-ScreenMode currentScreen = DASHBOARD_SCREEN;
 
 // Touch debounce variables
 unsigned long lastTouchTime = 0;
@@ -783,387 +887,164 @@ void connectToWiFi() {
   }
 }
 
-// Update Display Function
-// Clock display function removed - only dashboard is used
+// (Weather dashboard/fetch code removed - this build is chat-only: keyboard +
+// input box + Gemini reply. See createChatScreen() below.)
 
-// IP Display function removed - only dashboard is used
+// ---------------------------------------------------------------------------
+// AI Companion chat screen (Gemini text chat) - this is now the ONLY screen.
+// ---------------------------------------------------------------------------
+// A reply area, a one-line textarea, a Send button, and an lv_keyboard that
+// pops up when the textarea is focused. Touch input already flows through
+// GT911 -> my_touchpad_read -> lvgl indev, so the keyboard works for free.
+//
+// NOTE: queryGemini() blocks on HTTPClient for the duration of the request
+// (roughly 1-3s), which stalls lv_timer_handler()/animations for that time.
+// Fine for this MVP; if that stall becomes noticeable, move the call into
+// its own FreeRTOS task and hand the result back through a queue/flag
+// (see the Atomic<> critical-section pattern in include/ESP323248S035.hpp).
 
-// Weather API Function
-// Weather functions removed - only dashboard is used
+lv_obj_t * chat_input_ta = nullptr;
+lv_obj_t * chat_response_label = nullptr;
+lv_obj_t * chat_kb = nullptr;
 
-// Function declarations
-void createDashboardDisplay();
-
-// Fetch weather data from API (called every hour)
-void fetchWeatherData() {
+// Ask Gemini `prompt` and return its reply text (or an error string).
+String queryGemini(const String &prompt) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected, skipping weather update");
-    return;
+    return "No WiFi connection";
   }
-  
+
+  WiFiClientSecure client;
+  client.setInsecure(); // skip TLS cert validation - acceptable for a hobby project
+
   HTTPClient http;
-  // Use the 5 day / 3 hour forecast API to get daily predictions
-  String url = "http://api.openweathermap.org/data/2.5/forecast?q=" + String(WEATHER_CITY) + "," + String(WEATHER_COUNTRY) + "&appid=" + String(WEATHER_API_KEY) + "&units=metric";
-  
-  http.begin(url);
-  int httpCode = http.GET();
-  
-  if (httpCode > 0) {
+  const String url =
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent";
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-goog-api-key", GEMINI_API_KEY);
+
+  JsonDocument reqDoc;
+  reqDoc["contents"][0]["parts"][0]["text"] = prompt;
+  String reqBody;
+  serializeJson(reqDoc, reqBody);
+
+  String result = "Error contacting Gemini";
+  int httpCode = http.POST(reqBody);
+
+  if (httpCode == HTTP_CODE_OK) {
     String payload = http.getString();
-    // Serial.println("Forecast API Response: " + payload); // Can be very long
-    
+
+    // Only keep the field we actually need - keeps parsing cheap on 320KB RAM.
+    JsonDocument filter;
+    filter["candidates"][0]["content"]["parts"][0]["text"] = true;
+
     JsonDocument doc;
-    deserializeJson(doc, payload);
-    
-    if (doc["list"]) {
-      // --- Update CURRENT weather from the first forecast entry ---
-      float temp = doc["list"][0]["main"]["temp"];
-      float temp_max = doc["list"][0]["main"]["temp_max"];
-      int humidity = doc["list"][0]["main"]["humidity"];
-      String description = doc["list"][0]["weather"][0]["description"];
-      
-      // Update weather widget (center)
-      if (dashboard_weather_temp_label) {
-        char tempBuffer[10];
-        sprintf(tempBuffer, "%.0f°C", temp);
-        lv_label_set_text(dashboard_weather_temp_label, tempBuffer);
-      }
-      
-      if (dashboard_weather_desc_label) {
-        String desc = description;
-        desc.toUpperCase();
-        lv_label_set_text(dashboard_weather_desc_label, desc.c_str());
-      }
-      
-      lv_obj_t * max_temp_label = lv_obj_get_child(lv_obj_get_parent(dashboard_weather_temp_label), 1);
-      if (max_temp_label) {
-        char maxTempBuffer[15];
-        sprintf(maxTempBuffer, "MAX %.0f°C", temp_max);
-        lv_label_set_text(max_temp_label, maxTempBuffer);
-      }
-
-      // Update temperature widget (right) with real data
-      if (dashboard_set_temp_label) {
-        char tempBuffer[10];
-        sprintf(tempBuffer, "%.1f°C", temp);
-        lv_label_set_text(dashboard_set_temp_label, tempBuffer);
-      }
-      if (dashboard_room_temp_label) {
-        char currentTempBuffer[20];
-        sprintf(currentTempBuffer, "CURRENT %.1f°", temp);
-        lv_label_set_text(dashboard_room_temp_label, currentTempBuffer);
-      }
-      if (dashboard_humidity_label) {
-        char humidityBuffer[20];
-        sprintf(humidityBuffer, "HUMIDITY %d%%", humidity);
-        lv_label_set_text(dashboard_humidity_label, humidityBuffer);
-      }
-
-      // --- Update FORECAST labels for the next 3 days ---
-      // We'll pick forecasts at roughly 24h intervals (8th, 16th, 24th entry in a 3-hour list)
-      const int forecasts_to_show = 3;
-      int forecast_indices[] = {7, 15, 23}; // Approx. 24, 48, 72 hours ahead
-
-      for (int i = 0; i < forecasts_to_show; i++) {
-        if (dashboard_forecast_labels[i]) {
-          int index = forecast_indices[i];
-          if (doc["list"][index]) {
-            String forecast_desc = doc["list"][index]["weather"][0]["main"];
-            char forecastBuffer[30];
-            sprintf(forecastBuffer, "Day +%d: %s", i + 1, forecast_desc.c_str());
-            lv_label_set_text(dashboard_forecast_labels[i], forecastBuffer);
-          }
-        }
-      }
-      
-      Serial.println("Weather and forecast data updated successfully");
+    DeserializationError err =
+        deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+    if (!err) {
+      const char *text = doc["candidates"][0]["content"]["parts"][0]["text"];
+      if (text) result = String(text);
+    } else {
+      result = "Parse error";
+      Serial.println(err.c_str());
     }
   } else {
-    Serial.println("Forecast API request failed: " + String(httpCode));
+    result = "HTTP error: " + String(httpCode);
+    Serial.println(http.getString());
   }
-  
+
   http.end();
+  return result;
 }
 
-// Switch between screens
-void switchScreen() {
-  // Only dashboard screen - no switching needed
-  Serial.println("Dashboard screen - no switching available");
+void sendChatMessage(lv_event_t *e) {
+  if (!chat_input_ta || !chat_response_label) return;
+
+  const char *prompt = lv_textarea_get_text(chat_input_ta);
+  if (strlen(prompt) == 0) return;
+
+  String promptCopy = prompt; // queryGemini() clears the textarea below
+  lv_label_set_text(chat_response_label, "Thinking...");
+  lv_obj_add_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
+  lv_refr_now(NULL); // paint "Thinking..." before the blocking HTTP call
+
+  String reply = queryGemini(promptCopy);
+
+  lv_label_set_text(chat_response_label, reply.c_str());
+  lv_textarea_set_text(chat_input_ta, "");
 }
 
-// Dashboard Update Function
-void updateDashboard(lv_timer_t * timer) {
-  // Only update if we're on the dashboard screen
-  if (currentScreen != DASHBOARD_SCREEN) {
-    return;
+// Show/hide the keyboard as the textarea gains/loses focus, and treat the
+// keyboard's Enter key the same as tapping Send.
+void chatTextareaEventCb(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_FOCUSED) {
+    lv_obj_clear_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
+  } else if (code == LV_EVENT_DEFOCUSED) {
+    lv_obj_add_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
   }
-  
-  // Static variable to track weather update timing (every hour)
-  static unsigned long lastWeatherUpdate = 0;
-  unsigned long currentTime = millis();
-  
-  // Update time and date (every second)
-  time_t now = time(nullptr);
-  if (now > 1000000000) { // Check if time is properly synced (after year 2001)
-    struct tm * timeinfo = localtime(&now);
-    
-    if (dashboard_time_label) {
-      char timeBuffer[20];
-      sprintf(timeBuffer, "%02d:%02d", timeinfo->tm_hour, timeinfo->tm_min);
-      lv_label_set_text(dashboard_time_label, timeBuffer);
-    }
-    
-    if (dashboard_date_label) {
-      char dateBuffer[50];
-      const char* days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-      const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", 
-                             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-      sprintf(dateBuffer, "%s, %s %d", days[timeinfo->tm_wday], months[timeinfo->tm_mon], timeinfo->tm_mday);
-      lv_label_set_text(dashboard_date_label, dateBuffer);
-    }
-    
-    // Update weather data only every hour (3600000 ms = 1 hour)
-    if (currentTime - lastWeatherUpdate > 3600000 || lastWeatherUpdate == 0) {
-      Serial.println("Updating weather data (hourly update)...");
-      fetchWeatherData();
-      lastWeatherUpdate = currentTime;
-    }
-  } else {
-    // Time not synced yet, show syncing status
-    if (dashboard_time_label) {
-      lv_label_set_text(dashboard_time_label, "Syncing...");
-    }
-    if (dashboard_date_label) {
-      lv_label_set_text(dashboard_date_label, "Connecting...");
-    }
-    
-    // Try to sync time again if WiFi is connected
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("Time not synced, reconfiguring NTP...");
-      configTime(GMT_OFFSET, DAYLIGHT_OFFSET, NTP_SERVER);
-    }
-  }
-  
-  // Update greeting based on time
-  if (dashboard_greeting_label) {
-    time_t now = time(nullptr);
-    if (now > 0) {
-      struct tm * timeinfo = localtime(&now);
-      int hour = timeinfo->tm_hour;
-      
-      if (hour < 10) {
-        lv_label_set_text(dashboard_greeting_label, "Good morning, Eko!");
-      } else if (hour < 18) {
-        lv_label_set_text(dashboard_greeting_label, "Good afternoon, Eko!");
-      } else {
-        lv_label_set_text(dashboard_greeting_label, "Good evening, Eko!");
-      }
-    }
-  }
-  
-         // Update room temperature (simulated) - REMOVED, now updated from API
-         // if (dashboard_room_temp_label) {
-         //   static float roomTemp = 22.5;
-         //   roomTemp += (random(-10, 11) / 100.0); // Small random variation
-         //   if (roomTemp < 20) roomTemp = 20;
-         //   if (roomTemp > 25) roomTemp = 25;
-           
-         //   char tempBuffer[20];
-         //   sprintf(tempBuffer, "CURRENT %.1f°", roomTemp);
-         //   lv_label_set_text(dashboard_room_temp_label, tempBuffer);
-         // }
-         
-         // Update humidity (simulated) - REMOVED, now updated from API
-         // if (dashboard_humidity_label) {
-         //   static int humidity = 65;
-         //   humidity += random(-2, 3);
-         //   if (humidity < 50) humidity = 50;
-         //   if (humidity > 80) humidity = 80;
-           
-         //   char humidityBuffer[20];
-         //   sprintf(humidityBuffer, "HUMIDITY %d%%", humidity);
-         //   lv_label_set_text(dashboard_humidity_label, humidityBuffer);
-         // }
-         
-         // Update weather forecast (simulated) - REMOVED, now updated from API
-         // for (int i = 0; i < 3; i++) {
-         //   if (dashboard_forecast_labels[i]) {
-         //     static int forecastTemps[3] = {30, 32, 28};
-         //     forecastTemps[i] += random(-1, 2);
-         //     if (forecastTemps[i] < 25) forecastTemps[i] = 25;
-         //     if (forecastTemps[i] > 35) forecastTemps[i] = 35;
-             
-         //     char forecastBuffer[30];
-         //     sprintf(forecastBuffer, "Day %d: %d°C", i + 1, forecastTemps[i]);
-         //     lv_label_set_text(dashboard_forecast_labels[i], forecastBuffer);
-         //   }
-         // }
 }
 
-// Create Dashboard Display UI
-void createDashboardDisplay() {
-  // Clear screen
+void chatKeyboardEventCb(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_READY) { // Enter/checkmark key
+    sendChatMessage(e);
+  } else if (code == LV_EVENT_CANCEL) { // hide/close key
+    lv_obj_add_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+// Builds the entire (only) screen: reply area on top, input box + Send
+// button below it, and an lv_keyboard that pops up when the input box is
+// focused. Called once from setup().
+void createChatScreen() {
   lv_obj_clean(lv_scr_act());
-  
-  // Set modern dark background
   lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x0f172a), 0);
-  
-  // Top bar - compact
-  lv_obj_t * top_bar = lv_obj_create(lv_scr_act());
-  lv_obj_set_size(top_bar, 480, 35);
-  lv_obj_set_pos(top_bar, 0, 0);
-  lv_obj_set_style_bg_color(top_bar, lv_color_hex(0x1e293b), 0);
-  lv_obj_set_style_border_width(top_bar, 0, 0);
-  lv_obj_set_style_radius(top_bar, 0, 0);
-  
-  // Date in top bar (left)
-  dashboard_date_label = lv_label_create(top_bar);
-  lv_label_set_text(dashboard_date_label, "Sat, Sep 27");
-  lv_obj_set_style_text_color(dashboard_date_label, lv_color_hex(0xffffff), 0);
-  lv_obj_set_style_text_font(dashboard_date_label, &lv_font_montserrat_14, 0);
-  lv_obj_align(dashboard_date_label, LV_ALIGN_LEFT_MID, 15, 0);
-  
-  // Greeting (right side)
-  dashboard_greeting_label = lv_label_create(top_bar);
-  lv_label_set_text(dashboard_greeting_label, "Good morning, Eko!");
-  lv_obj_set_style_text_color(dashboard_greeting_label, lv_color_hex(0xffffff), 0);
-  lv_obj_set_style_text_font(dashboard_greeting_label, &lv_font_montserrat_14, 0);
-  lv_obj_align(dashboard_greeting_label, LV_ALIGN_RIGHT_MID, -15, 0);
-  
-  // Main content area - more space
-  lv_obj_t * main_area = lv_obj_create(lv_scr_act());
-  lv_obj_set_size(main_area, 480, 285);
-  lv_obj_set_pos(main_area, 0, 35);
-  lv_obj_set_style_bg_color(main_area, lv_color_hex(0x0f172a), 0);
-  lv_obj_set_style_border_width(main_area, 0, 0);
-  lv_obj_set_style_radius(main_area, 0, 0);
-  
-  // Row 1: Time, Weather, Temperature (3 equal columns - within 450px from left)
-  // Green box reference: 450px wide from x=0 (left edge)
-  // Top widgets should fit within same 450px area
-  // Widget width: 140px each, Gap: 15px between widgets  
-  // Layout within 450px: 140px + 15px + 140px + 15px + 140px = 450px (perfect fit!)
-  
-  // Widget 1: Time and Location
-  lv_obj_t * time_widget = lv_obj_create(main_area);
-  lv_obj_set_size(time_widget, 140, 120);
-  lv_obj_set_pos(time_widget, 0, 10);
-  lv_obj_set_style_bg_color(time_widget, lv_color_hex(0x1e293b), 0);
-  lv_obj_set_style_border_width(time_widget, 1, 0);
-  lv_obj_set_style_border_color(time_widget, lv_color_hex(0x334155), 0);
-  lv_obj_set_style_radius(time_widget, 8, 0);
-  
-  dashboard_time_label = lv_label_create(time_widget);
-  lv_label_set_text(dashboard_time_label, "09:56");
-  lv_obj_set_style_text_color(dashboard_time_label, lv_color_hex(0xffffff), 0);
-  lv_obj_set_style_text_font(dashboard_time_label, &lv_font_montserrat_28, 0);
-  lv_obj_align(dashboard_time_label, LV_ALIGN_CENTER, 0, -10);
-  
-  dashboard_location_label = lv_label_create(time_widget);
-  lv_label_set_text(dashboard_location_label, "Jakarta, ID");
-  lv_obj_set_style_text_color(dashboard_location_label, lv_color_hex(0x94a3b8), 0);
-  lv_obj_set_style_text_font(dashboard_location_label, &lv_font_montserrat_14, 0);
-  lv_obj_align(dashboard_location_label, LV_ALIGN_BOTTOM_MID, 0, -15);
-  
-  // Widget 2: Current Weather (center)
-  lv_obj_t * weather_widget = lv_obj_create(main_area);
-  lv_obj_set_size(weather_widget, 140, 120);
-  lv_obj_set_pos(weather_widget, 155, 10);
-  lv_obj_set_style_bg_color(weather_widget, lv_color_hex(0x1e293b), 0);
-  lv_obj_set_style_border_width(weather_widget, 1, 0);
-  lv_obj_set_style_border_color(weather_widget, lv_color_hex(0x334155), 0);
-  lv_obj_set_style_radius(weather_widget, 8, 0);
-  
-  dashboard_weather_temp_label = lv_label_create(weather_widget);
-  lv_label_set_text(dashboard_weather_temp_label, "32°C");
-  lv_obj_set_style_text_color(dashboard_weather_temp_label, lv_color_hex(0xffffff), 0);
-  lv_obj_set_style_text_font(dashboard_weather_temp_label, &lv_font_montserrat_20, 0);
-  lv_obj_align(dashboard_weather_temp_label, LV_ALIGN_TOP_MID, 0, 10);
-  
-  lv_obj_t * max_temp_label = lv_label_create(weather_widget);
-  lv_label_set_text(max_temp_label, "MAX 35°C");
-  lv_obj_set_style_text_color(max_temp_label, lv_color_hex(0x94a3b8), 0);
-  lv_obj_set_style_text_font(max_temp_label, &lv_font_montserrat_14, 0);
-  lv_obj_align(max_temp_label, LV_ALIGN_TOP_MID, 0, 35);
-  
-  dashboard_weather_icon = lv_label_create(weather_widget);
-  lv_label_set_text(dashboard_weather_icon, "☁️");
-  lv_obj_set_style_text_font(dashboard_weather_icon, &lv_font_montserrat_16, 0);
-  lv_obj_align(dashboard_weather_icon, LV_ALIGN_BOTTOM_MID, 0, -30);
-  
-  dashboard_weather_desc_label = lv_label_create(weather_widget);
-  lv_label_set_text(dashboard_weather_desc_label, "Overcast");
-  lv_obj_set_style_text_color(dashboard_weather_desc_label, lv_color_hex(0x94a3b8), 0);
-  lv_obj_set_style_text_font(dashboard_weather_desc_label, &lv_font_montserrat_14, 0);
-  lv_obj_align(dashboard_weather_desc_label, LV_ALIGN_BOTTOM_MID, 0, -8);
-  
-  // Widget 3: Temperature Control (right)
-  lv_obj_t * temp_widget = lv_obj_create(main_area);
-  lv_obj_set_size(temp_widget, 140, 120);
-  lv_obj_set_pos(temp_widget, 310, 10);
-  lv_obj_set_style_bg_color(temp_widget, lv_color_hex(0x1e293b), 0);
-  lv_obj_set_style_border_width(temp_widget, 1, 0);
-  lv_obj_set_style_border_color(temp_widget, lv_color_hex(0x334155), 0);
-  lv_obj_set_style_radius(temp_widget, 8, 0);
-  
-  lv_obj_t * temp_title = lv_label_create(temp_widget);
-  lv_label_set_text(temp_title, "Temperature");
-  lv_obj_set_style_text_color(temp_title, lv_color_hex(0xffffff), 0);
-  lv_obj_set_style_text_font(temp_widget, &lv_font_montserrat_14, 0);
-  lv_obj_align(temp_title, LV_ALIGN_TOP_MID, 0, 5);
-  
-  dashboard_set_temp_label = lv_label_create(temp_widget);
-  lv_label_set_text(dashboard_set_temp_label, "23°C");
-  lv_obj_set_style_text_color(dashboard_set_temp_label, lv_color_hex(0x06b6d4), 0);
-  lv_obj_set_style_text_font(dashboard_set_temp_label, &lv_font_montserrat_20, 0);
-  lv_obj_align(dashboard_set_temp_label, LV_ALIGN_TOP_MID, 0, 23);
-  
-  dashboard_room_temp_label = lv_label_create(temp_widget);
-  lv_label_set_text(dashboard_room_temp_label, "CURRENT 22.0°");
-  lv_obj_set_style_text_color(dashboard_room_temp_label, lv_color_hex(0x94a3b8), 0);
-  lv_obj_set_style_text_font(dashboard_room_temp_label, &lv_font_montserrat_14, 0);
-  lv_obj_align(dashboard_room_temp_label, LV_ALIGN_BOTTOM_MID, 0, -25);
-  
-  dashboard_humidity_label = lv_label_create(temp_widget);
-  lv_label_set_text(dashboard_humidity_label, "HUMIDITY 69%");
-  lv_obj_set_style_text_color(dashboard_humidity_label, lv_color_hex(0x94a3b8), 0);
-  lv_obj_set_style_text_font(dashboard_humidity_label, &lv_font_montserrat_14, 0);
-  lv_obj_align(dashboard_humidity_label, LV_ALIGN_BOTTOM_MID, 0, -5);
-  
-  // Row 2: Forecast (450px wide from left edge - matching green box)
-  lv_obj_t * forecast_widget = lv_obj_create(main_area);
-  lv_obj_set_size(forecast_widget, 450, 55);
-  lv_obj_set_pos(forecast_widget, 0, 140);
-  lv_obj_set_style_bg_color(forecast_widget, lv_color_hex(0x1e293b), 0);
-  lv_obj_set_style_border_width(forecast_widget, 1, 0);
-  lv_obj_set_style_border_color(forecast_widget, lv_color_hex(0x334155), 0);
-  lv_obj_set_style_radius(forecast_widget, 8, 0);
-  
-  // 3-day forecast in horizontal layout
-  for (int i = 0; i < 3; i++) {
-    dashboard_forecast_labels[i] = lv_label_create(forecast_widget);
-    char forecast[20];
-    sprintf(forecast, "Day + %d: 27°C", i + 1);
-    lv_label_set_text(dashboard_forecast_labels[i], forecast);
-    lv_obj_set_style_text_color(dashboard_forecast_labels[i], lv_color_hex(0x94a3b8), 0);
-    lv_obj_set_style_text_font(dashboard_forecast_labels[i], &lv_font_montserrat_14, 0);
-    lv_obj_align(dashboard_forecast_labels[i], LV_ALIGN_LEFT_MID, 20 + (i * 140), 0);
-  }
-  
-  // Green box at bottom (450px wide from left edge - as originally working)
-  lv_obj_t * green_box = lv_obj_create(main_area);
-  lv_obj_set_size(green_box, 450, 40);
-  lv_obj_set_pos(green_box, 0, 205);
-  lv_obj_set_style_bg_color(green_box, lv_color_hex(0x00FF00), 0);
-  lv_obj_set_style_border_width(green_box, 0, 0);
-  lv_obj_set_style_radius(green_box, 8, 0);
 
-  // Create dashboard update timer
-  dashboard_timer = lv_timer_create(updateDashboard, 1000, NULL);
-  
-  // Initial update
-  updateDashboard(NULL);
+  // Reply area - kept compact so the keyboard below can be as large as
+  // possible (bigger keys = easier to hit accurately on this panel).
+  lv_obj_t *response_box = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(response_box, 460, 95);
+  lv_obj_align(response_box, LV_ALIGN_TOP_MID, 0, 5);
+  lv_obj_set_style_bg_color(response_box, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(response_box, 1, 0);
+  lv_obj_set_style_border_color(response_box, lv_color_hex(0x334155), 0);
+  lv_obj_set_style_radius(response_box, 8, 0);
+
+  chat_response_label = lv_label_create(response_box);
+  lv_label_set_long_mode(chat_response_label, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(chat_response_label, 430);
+  lv_label_set_text(chat_response_label, "Ask me anything!");
+  lv_obj_set_style_text_color(chat_response_label, lv_color_hex(0xffffff), 0);
+  lv_obj_set_style_text_font(chat_response_label, &lv_font_montserrat_14, 0);
+  lv_obj_align(chat_response_label, LV_ALIGN_TOP_LEFT, 5, 5);
+
+  // Input row: textarea + Send button
+  chat_input_ta = lv_textarea_create(lv_scr_act());
+  lv_obj_set_size(chat_input_ta, 340, 35);
+  lv_obj_align(chat_input_ta, LV_ALIGN_TOP_LEFT, 10, 105);
+  lv_textarea_set_one_line(chat_input_ta, true);
+  lv_textarea_set_placeholder_text(chat_input_ta, "Type a message...");
+  lv_obj_add_event_cb(chat_input_ta, chatTextareaEventCb, LV_EVENT_ALL, NULL);
+
+  lv_obj_t *send_btn = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(send_btn, 100, 35);
+  lv_obj_align(send_btn, LV_ALIGN_TOP_RIGHT, -10, 105);
+  lv_obj_add_event_cb(send_btn, sendChatMessage, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *send_label = lv_label_create(send_btn);
+  lv_label_set_text(send_label, "Send");
+  lv_obj_center(send_label);
+
+  // Keyboard, hidden until the textarea is focused. Fills the rest of the
+  // screen (175px tall vs the original 110px) for bigger, easier-to-hit keys.
+  chat_kb = lv_keyboard_create(lv_scr_act());
+  lv_keyboard_set_textarea(chat_kb, chat_input_ta);
+  lv_obj_set_size(chat_kb, 480, 175);
+  lv_obj_align(chat_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_add_event_cb(chat_kb, chatKeyboardEventCb, LV_EVENT_ALL, NULL);
+  lv_obj_add_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
 }
+
 
 /* 显示器刷新 */
 void my_disp_flush( lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p )
@@ -1336,10 +1217,15 @@ void setup()
     indev_drv.type = LV_INDEV_TYPE_POINTER;
   indev_drv.read_cb = my_touchpad_read;
   lv_indev_drv_register( &indev_drv );
-  
-  // Create dashboard display first (show immediately)
-  Serial.println("Creating dashboard display...");
-  createDashboardDisplay();
+
+  // Calibrate touch (2-point, on-device) before building the real UI, so
+  // every interactive element benefits from it.
+  Serial.println("Running touch calibration...");
+  runTouchCalibration();
+
+  // Create the chat UI first (show immediately)
+  Serial.println("Creating chat screen...");
+  createChatScreen();
   
   // Force initial display refresh
   lv_refr_now(NULL);
@@ -1362,9 +1248,12 @@ void setup()
 
 void loop()
 {
-         // Touch input disabled - only dashboard screen
-         GT911_Scan();
-
+  // NOTE: don't call GT911_Scan() directly here - lv_timer_handler() already
+  // polls touch via the registered indev (my_touchpad_read -> readRawTouch
+  // -> GT911_Scan). Calling it again here was pure waste: GT911_Scan()
+  // blocks for ~10ms whenever there's no touch, so doing it twice per loop
+  // needlessly halved the effective poll rate and made the keyboard feel
+  // laggy.
   lv_timer_handler(); /* 让GUI完成它的工作 */
   delay( 10 );
 }
