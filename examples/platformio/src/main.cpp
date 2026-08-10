@@ -4,6 +4,7 @@
 #include <time.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h> // NVS storage for the on-device WiFi manager
 #include "esp_system.h" // esp_reset_reason() - TEMP/DEBUG, see setup()
 
 #include <lvgl.h>
@@ -227,12 +228,25 @@ uint8_t IIC_Read_Byte(unsigned char ack)
 }
 
 
+// Bit-banged I2C timing (delay_us() below is a plain busy-wait loop, not an
+// RTOS-aware delay) can get corrupted if a higher-priority task - notably
+// WiFi's, which runs aggressively during WiFi.scanNetworks() - preempts the
+// CPU mid-transaction. Touch going completely unresponsive after a WiFi
+// scan (confirmed on real hardware: zero raw touch reads afterward, not
+// just missed clicks) is consistent with that. Wrapping each full
+// transaction in a critical section (interrupts/task-switching disabled on
+// this core) protects it; transactions here are short (a handful of bytes
+// for normal touch polling, up to ~186 for the one-time GT911 config dump
+// in gt911_int_()), so the section stays brief.
+static portMUX_TYPE gt911_i2c_mux = portMUX_INITIALIZER_UNLOCKED;
+
 //reg:起始寄存器地址
 //buf:数据缓缓存区
 //len:写数据长度
 //返回值:0,成功;1,失败.
 uint8_t GT911_WR_Reg(uint16_t reg, uint8_t *buf, uint8_t len)
 {
+  portENTER_CRITICAL(&gt911_i2c_mux);
   uint8_t i;
   uint8_t ret = 0;
   IIC_Start();
@@ -249,6 +263,7 @@ uint8_t GT911_WR_Reg(uint16_t reg, uint8_t *buf, uint8_t len)
     if (ret)break;
   }
   IIC_Stop();                    //产生一个停止条件
+  portEXIT_CRITICAL(&gt911_i2c_mux);
   return ret;
 }
 
@@ -257,6 +272,7 @@ uint8_t GT911_WR_Reg(uint16_t reg, uint8_t *buf, uint8_t len)
 //len:读数据长度
 void GT911_RD_Reg(uint16_t reg, uint8_t *buf, uint8_t len)
 {
+  portENTER_CRITICAL(&gt911_i2c_mux);
   uint8_t i;
   IIC_Start();
   IIC_Send_Byte(GT_CMD_WR);   //发送写命令
@@ -273,6 +289,7 @@ void GT911_RD_Reg(uint16_t reg, uint8_t *buf, uint8_t len)
     buf[i] = IIC_Read_Byte(i == (len - 1) ? 0 : 1); //发数据
   }
   IIC_Stop();//产生一个停止条件
+  portEXIT_CRITICAL(&gt911_i2c_mux);
 }
 
 //发送配置参数
@@ -797,104 +814,9 @@ void lv_example_btn(void)
 }
 //_______________________
 
-// WiFi Connection Function
-void connectToWiFi() {
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(WIFI_SSID);
-  
-  // WiFi status codes for debugging
-  const char* wifiStatusText[] = {
-    "IDLE_STATUS", "NO_SSID_AVAIL", "SCAN_COMPLETED", "CONNECTED", 
-    "CONNECT_FAILED", "CONNECTION_LOST", "DISCONNECTED"
-  };
-  
-  // Disconnect and reset WiFi
-  WiFi.disconnect(true);
-  delay(1000);
-  
-  // Set WiFi mode to Station
-  WiFi.mode(WIFI_STA);
-  delay(100);
-  
-  // Scan for available networks first
-  Serial.println("Scanning for networks...");
-  int n = WiFi.scanNetworks();
-  Serial.print("Found ");
-  Serial.print(n);
-  Serial.println(" networks:");
-  
-  bool networkFound = false;
-  for (int i = 0; i < n; i++) {
-    Serial.print(i + 1);
-    Serial.print(": ");
-    Serial.print(WiFi.SSID(i));
-    Serial.print(" (");
-    Serial.print(WiFi.RSSI(i));
-    Serial.print(" dBm) ");
-    Serial.println((WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "Open" : "Encrypted");
-    
-    if (WiFi.SSID(i) == WIFI_SSID) {
-      networkFound = true;
-      Serial.print("*** Target network found! ***");
-    }
-  }
-  
-  if (!networkFound) {
-    Serial.println("ERROR: Target network 'wifilab' not found in scan!");
-    Serial.println("Please check the SSID name.");
-    return;
-  }
-  
-  // Begin connection
-  Serial.println("Starting connection...");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  
-  int attempts = 0;
-  const int maxAttempts = 20; // 20 seconds timeout
-  
-  while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
-    delay(1000);
-    attempts++;
-    int status = WiFi.status();
-    Serial.print("Attempt ");
-    Serial.print(attempts);
-    Serial.print("/");
-    Serial.print(maxAttempts);
-    Serial.print(" - WiFi status: ");
-    Serial.print(status);
-    if (status >= 0 && status <= 6) {
-      Serial.print(" (");
-      Serial.print(wifiStatusText[status]);
-      Serial.print(")");
-    }
-    Serial.println();
-    
-    // Print signal strength if available
-    if (status == WL_CONNECTED || status == WL_DISCONNECTED) {
-      Serial.print("Signal strength: ");
-      Serial.print(WiFi.RSSI());
-      Serial.println(" dBm");
-    }
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi connected!");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("Signal strength: ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
-    } else {
-    Serial.println("WiFi connection failed!");
-    Serial.print("Final status: ");
-    Serial.println(WiFi.status());
-    Serial.println("Possible issues:");
-    Serial.println("1. Wrong SSID or password");
-    Serial.println("2. WiFi network not available");
-    Serial.println("3. Signal too weak");
-    Serial.println("4. Network security issues");
-  }
-}
+// (Old hardcoded-credentials connectToWiFi() removed - replaced by the
+// NVS-backed on-device WiFi manager further down: loadSavedWifi(),
+// tryConnectWifi(), runWifiSetupFlow(), wired up in setup().)
 
 // (Weather dashboard/fetch code removed - this build is chat-only: keyboard +
 // input box + Gemini reply. See createChatScreen() below.)
@@ -918,9 +840,11 @@ lv_obj_t * chat_kb = nullptr;
 lv_obj_t * chat_response_box = nullptr;
 lv_obj_t * chat_send_btn = nullptr;
 lv_obj_t * chat_back_btn = nullptr;
+lv_obj_t * chat_wifi_gear_btn = nullptr;
 lv_obj_t * chat_header_bar = nullptr;
 lv_obj_t * chat_time_label = nullptr;
 lv_obj_t * chat_wifi_label = nullptr;
+lv_timer_t * g_chatHeaderTimer = nullptr;
 
 // Refreshes the header's clock + WiFi status. Called on a timer and once
 // right after the header is built.
@@ -953,21 +877,21 @@ void setChatTypingMode(bool typing) {
     lv_obj_add_flag(chat_response_box, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(chat_send_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(chat_back_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(chat_wifi_gear_btn, LV_OBJ_FLAG_HIDDEN);
     // Input box is DISPLAY ONLY while typing (T9 writes into it directly -
     // see t9KeypadEventCb - you never need to tap it here), so unlike the
-    // back button it's fine for it to sit up in the confirmed touch dead
-    // zone (y<110 - see runTouchCalibration()'s P1Y): big and visible at
-    // the top, full width.
+    // back/gear buttons it's fine for it to sit up in the confirmed touch
+    // dead zone (y<110 - see runTouchCalibration()'s P1Y): big and visible
+    // at the top, full width.
     lv_obj_set_size(chat_input_ta, 460, 100);
     lv_obj_align(chat_input_ta, LV_ALIGN_TOP_MID, 0, 8);
-    // Back DOES need to be tappable, so it still can't go in the dead zone -
-    // but instead of its own horizontal row (which cost the keypad height),
-    // it's now a tall vertical strip beside the keypad, costing width
-    // instead. y=113 is the same dead-zone boundary as before; height=202
-    // now spans the FULL safe area down to y=315, all of which the keypad
-    // used to have to share with a separate back-button row.
-    lv_obj_set_size(chat_back_btn, 70, 202);
-    lv_obj_align(chat_back_btn, LV_ALIGN_TOP_RIGHT, -10, 113);
+    // Back/gear DO need to be tappable, so they still can't go in the dead
+    // zone - but instead of a horizontal row (which cost the keypad
+    // height), they're a tall vertical strip beside the keypad (split into
+    // two stacked buttons - see createChatScreen()), costing width instead.
+    // y=113 is the same dead-zone boundary as before; together they span
+    // the full safe area down to y=315, all of which the keypad used to
+    // have to share with a separate row above it.
     lv_obj_set_size(chat_kb, 380, 202);
     lv_obj_align(chat_kb, LV_ALIGN_TOP_LEFT, 10, 113);
     lv_obj_clear_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
@@ -976,6 +900,7 @@ void setChatTypingMode(bool typing) {
     lv_obj_clear_flag(chat_response_box, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(chat_send_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(chat_back_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(chat_wifi_gear_btn, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_size(chat_input_ta, 340, 40);
     lv_obj_align(chat_input_ta, LV_ALIGN_TOP_LEFT, 10, 270);
     lv_obj_align(chat_send_btn, LV_ALIGN_TOP_RIGHT, -10, 270);
@@ -988,6 +913,21 @@ void setChatTypingMode(bool typing) {
 // that got tied to Send-only (see the note on chatTextareaEventCb).
 void backToChatBtnEventCb(lv_event_t *e) {
   setChatTypingMode(false);
+}
+
+// fwd decls - defined later (WiFi manager section / this function itself),
+// used by the gear button below before their real definitions are in scope.
+void createChatScreen();
+bool runWifiSetupFlow();
+
+// Gear button next to Back in the T9 keypad's side strip: jump straight
+// into the WiFi setup screens (scan/select/type password) from the chat
+// screen at any time, not just when there's no working connection at boot.
+// Set here, actually acted on from loop() - see the comment there for why.
+bool g_wifiSetupRequested = false;
+
+void changeWifiFromChatBtnEventCb(lv_event_t *e) {
+  g_wifiSetupRequested = true;
 }
 
 // Set once a conversation is underway; sending it back as
@@ -1224,8 +1164,9 @@ void createChatScreen() {
   lv_obj_set_style_text_font(chat_wifi_label, &lv_font_montserrat_14, 0);
   lv_obj_align(chat_wifi_label, LV_ALIGN_RIGHT_MID, -8, 0);
 
-  updateChatHeader(NULL);                            // paint real state immediately
-  lv_timer_create(updateChatHeader, 2000, NULL);      // then keep it fresh
+  updateChatHeader(NULL);                                     // paint real state immediately
+  if (g_chatHeaderTimer) lv_timer_del(g_chatHeaderTimer);      // don't stack a duplicate on repeat visits
+  g_chatHeaderTimer = lv_timer_create(updateChatHeader, 2000, NULL);
 
   // Reply area - fills essentially the rest of the screen (input row is
   // pinned to the bottom below it). Hidden while typing (see
@@ -1248,9 +1189,24 @@ void createChatScreen() {
 
   // Back-to-front button (typing mode only - hidden here, shown by
   // setChatTypingMode). Sits to the left of the input box.
+  // Right-side strip split into two stacked buttons: gear on top to jump
+  // into WiFi setup at any time, Back below to cancel typing (same total
+  // footprint as the old single button - still clear of the dead zone).
+  chat_wifi_gear_btn = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(chat_wifi_gear_btn, 70, 97);
+  lv_obj_align(chat_wifi_gear_btn, LV_ALIGN_TOP_RIGHT, -10, 113);
+  lv_obj_add_event_cb(chat_wifi_gear_btn, changeWifiFromChatBtnEventCb, LV_EVENT_CLICKED, NULL);
+  lv_obj_set_style_radius(chat_wifi_gear_btn, 16, 0);
+  lv_obj_set_style_bg_color(chat_wifi_gear_btn, lv_color_hex(0x334155), 0);
+  lv_obj_t *gear_label = lv_label_create(chat_wifi_gear_btn);
+  lv_label_set_text(gear_label, LV_SYMBOL_SETTINGS "\nWiFi");
+  lv_obj_set_style_text_align(gear_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_center(gear_label);
+  lv_obj_add_flag(chat_wifi_gear_btn, LV_OBJ_FLAG_HIDDEN);
+
   chat_back_btn = lv_btn_create(lv_scr_act());
-  lv_obj_set_size(chat_back_btn, 70, 202); // tall vertical strip beside the keypad, not a row above it
-  lv_obj_align(chat_back_btn, LV_ALIGN_TOP_RIGHT, -10, 113);
+  lv_obj_set_size(chat_back_btn, 70, 97);
+  lv_obj_align(chat_back_btn, LV_ALIGN_TOP_RIGHT, -10, 218); // 113 + 97 + 8 gap
   lv_obj_add_event_cb(chat_back_btn, backToChatBtnEventCb, LV_EVENT_CLICKED, NULL);
   lv_obj_set_style_radius(chat_back_btn, 16, 0);
   lv_obj_set_style_bg_color(chat_back_btn, lv_color_hex(0x334155), 0);
@@ -1308,6 +1264,520 @@ void createChatScreen() {
   lv_obj_add_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
 }
 
+// ---------------------------------------------------------------------------
+// On-device WiFi manager: scan for networks, pick one by tapping, type its
+// password on the same T9 keypad the chat screen uses, and save the result
+// to NVS (via Preferences) so it's remembered across reboots/reflashes -
+// no more hardcoding SSID/password in secrets.h and reflashing to change
+// networks. Runs once at boot, blocking (same lv_timer_handler()+delay()
+// polling pattern as runTouchCalibration()), before the chat screen is
+// built. Layout reuses the exact coordinates already proven safe on this
+// panel's touch dead zone (see setChatTypingMode()'s comments).
+// ---------------------------------------------------------------------------
+
+Preferences g_wifiPrefs;
+
+bool loadSavedWifi(String &ssid, String &pass) {
+  g_wifiPrefs.begin("wifi", true); // read-only
+  ssid = g_wifiPrefs.getString("ssid", "");
+  pass = g_wifiPrefs.getString("pass", "");
+  g_wifiPrefs.end();
+  return ssid.length() > 0;
+}
+
+void saveWifi(const String &ssid, const String &pass) {
+  g_wifiPrefs.begin("wifi", false);
+  g_wifiPrefs.putString("ssid", ssid);
+  g_wifiPrefs.putString("pass", pass);
+  g_wifiPrefs.end();
+}
+
+// Blocking connect attempt (up to ~10s), updating statusLabel (if given)
+// as it goes. Returns true on success.
+bool tryConnectWifi(const String &ssid, const String &pass, lv_obj_t *statusLabel) {
+  Serial.printf("Connecting to WiFi: %s\r\n", ssid.c_str());
+  WiFi.disconnect(true);
+  delay(1000); // full radio power-cycle from disconnect(true) needs this long to settle
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    attempts++;
+    if (statusLabel) {
+      String dots = "";
+      for (int i = 0; i < (attempts % 4); i++) dots += ".";
+      lv_label_set_text_fmt(statusLabel, "Connecting%s", dots.c_str());
+      lv_refr_now(NULL);
+    }
+  }
+  bool ok = (WiFi.status() == WL_CONNECTED);
+  Serial.println(ok ? "WiFi connected!" : "WiFi connect failed.");
+  return ok;
+}
+
+// Set by the list/password views' button handlers; polled by the blocking
+// runWifiSetupFlow() loop in setup() to know when to stop.
+bool g_wifiSetupDone = false;
+bool g_wifiSetupConnected = false;
+
+void gt911_int_(); // fwd decl - defined near the bottom of the file
+
+// --- Single combined setup screen -------------------------------------------
+// Network list and password entry are two VIEWS on the same screen, toggled
+// by show/hide - not separate screens rebuilt via lv_obj_clean(). Originally
+// these were two lv_obj_clean()-rebuilt screens; after the WiFi scan, touch
+// stopped registering at all (zero raw reads, not just missed clicks) and
+// neither re-running the GT911 init nor other fixes recovered it, so this
+// cuts the number of full screen tear-downs/rebuilds during the flow down
+// to just one (right when the flow starts), which also means backing out of
+// password entry to pick a different network doesn't need a re-scan.
+// ---------------------------------------------------------------------------
+
+// Network picker: a wide label (column 1) shows the currently-selected
+// SSID; Up/Select/Down (column 2) step through the scan results and
+// confirm one. This replaced a per-item clickable list (one button per
+// network in a shared container) that rendered fine but wouldn't reliably
+// register clicks - Up/Select/Down are the same kind of standalone lv_btn
+// directly on the screen as Skip/Cancel/gear/T9 keys, which have all
+// worked reliably, so this sidesteps whatever was specific to the list.
+// Column 1 is a real multi-row list now: WIFI_LIST_VISIBLE_ROWS row widgets
+// created once, refreshed in place by updateWifiListRows() as Up/Down move
+// the highlight (a sliding window over the scan results - no scrolling, no
+// per-row click handlers; rows are display-only, Select confirms the
+// highlighted one). Rows are plain lv_obj + label children of the box,
+// which is safe: the earlier unresponsive-list problem turned out to be the
+// nested lv_timer_handler() call (see loop()), not child widgets.
+#define WIFI_LIST_VISIBLE_ROWS 7
+lv_obj_t * wifi_current_box = nullptr;   // bordered container - hide/show target
+lv_obj_t * wifi_list_rows[WIFI_LIST_VISIBLE_ROWS] = {nullptr};   // row background objects
+lv_obj_t * wifi_list_row_labels[WIFI_LIST_VISIBLE_ROWS] = {nullptr}; // their text labels
+lv_obj_t * wifi_up_btn = nullptr;
+lv_obj_t * wifi_select_btn = nullptr;
+lv_obj_t * wifi_down_btn = nullptr;
+lv_obj_t * wifi_list_cancel_btn = nullptr;
+lv_obj_t * wifi_list_skip_btn = nullptr;
+int g_wifiListIdx = 0;
+int g_wifiListCount = 0;
+
+lv_obj_t * wifi_pw_title = nullptr;
+lv_obj_t * wifi_pw_ta = nullptr;
+lv_obj_t * wifi_pw_status_label = nullptr;
+lv_obj_t * wifi_pw_back_btn = nullptr;
+lv_obj_t * wifi_pw_kb = nullptr;
+String g_wifiSetupSsid = "";
+
+int g_wifiT9LastBtnIdx = -1;
+int g_wifiT9CyclePos = 0;
+uint32_t g_wifiT9LastPressMs = 0;
+
+void updateWifiListRows() {
+  if (g_wifiListCount <= 0) {
+    for (int i = 0; i < WIFI_LIST_VISIBLE_ROWS; i++) {
+      lv_obj_add_flag(wifi_list_rows[i], LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_clear_flag(wifi_list_rows[0], LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(wifi_list_row_labels[0], "No networks found");
+    return;
+  }
+
+  // Sliding window over the results, keeping the highlighted entry visible
+  // (roughly centered once the list is longer than the window).
+  int start = g_wifiListIdx - WIFI_LIST_VISIBLE_ROWS / 2;
+  if (start > g_wifiListCount - WIFI_LIST_VISIBLE_ROWS) start = g_wifiListCount - WIFI_LIST_VISIBLE_ROWS;
+  if (start < 0) start = 0;
+
+  for (int i = 0; i < WIFI_LIST_VISIBLE_ROWS; i++) {
+    int netIdx = start + i;
+    if (netIdx >= g_wifiListCount) {
+      lv_obj_add_flag(wifi_list_rows[i], LV_OBJ_FLAG_HIDDEN);
+      continue;
+    }
+    lv_obj_clear_flag(wifi_list_rows[i], LV_OBJ_FLAG_HIDDEN);
+    bool isOpen = (WiFi.encryptionType(netIdx) == WIFI_AUTH_OPEN);
+    lv_label_set_text_fmt(wifi_list_row_labels[i], "%s%s",
+                           isOpen ? "" : LV_SYMBOL_CLOSE " ",
+                           WiFi.SSID(netIdx).c_str());
+    bool highlighted = (netIdx == g_wifiListIdx);
+    lv_obj_set_style_bg_color(wifi_list_rows[i],
+                               highlighted ? lv_color_hex(0x22c55e) : lv_color_hex(0x1e293b), 0);
+    lv_obj_set_style_text_color(wifi_list_row_labels[i],
+                                 highlighted ? lv_color_hex(0x0f172a) : lv_color_hex(0xffffff), 0);
+  }
+}
+
+void showWifiListView() {
+  lv_obj_clear_flag(wifi_current_box, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(wifi_up_btn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(wifi_select_btn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(wifi_down_btn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(wifi_list_cancel_btn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(wifi_list_skip_btn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(wifi_pw_title, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(wifi_pw_ta, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(wifi_pw_status_label, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(wifi_pw_back_btn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(wifi_pw_kb, LV_OBJ_FLAG_HIDDEN);
+}
+
+void showWifiPasswordView(const String &ssid) {
+  g_wifiSetupSsid = ssid;
+  g_wifiT9LastBtnIdx = -1;
+  lv_label_set_text_fmt(wifi_pw_title, "Password for: %s", ssid.c_str());
+  lv_textarea_set_text(wifi_pw_ta, "");
+  lv_label_set_text(wifi_pw_status_label, "");
+
+  lv_obj_add_flag(wifi_current_box, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(wifi_up_btn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(wifi_select_btn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(wifi_down_btn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(wifi_list_cancel_btn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(wifi_list_skip_btn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(wifi_pw_title, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(wifi_pw_ta, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(wifi_pw_status_label, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(wifi_pw_back_btn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(wifi_pw_kb, LV_OBJ_FLAG_HIDDEN);
+}
+
+void wifiBackToListBtnEventCb(lv_event_t *e) {
+  showWifiListView();
+}
+
+void wifiPwKeypadEventCb(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  lv_obj_t *btnm = lv_event_get_target(e);
+  uint16_t idx = lv_btnmatrix_get_selected_btn(btnm);
+  if (idx == LV_BTNMATRIX_BTN_NONE) return;
+
+  if (idx == T9_BACKSPACE_IDX) {
+    lv_textarea_del_char(wifi_pw_ta);
+    g_wifiT9LastBtnIdx = -1;
+    return;
+  }
+  if (idx == T9_SEND_IDX) {
+    g_wifiT9LastBtnIdx = -1;
+    String pass = lv_textarea_get_text(wifi_pw_ta);
+    lv_label_set_text(wifi_pw_status_label, "Connecting...");
+    lv_refr_now(NULL);
+    if (tryConnectWifi(g_wifiSetupSsid, pass, wifi_pw_status_label)) {
+      saveWifi(g_wifiSetupSsid, pass);
+      g_wifiSetupConnected = true;
+      g_wifiSetupDone = true;
+    } else {
+      lv_label_set_text(wifi_pw_status_label, "Failed - check password, try again");
+    }
+    return;
+  }
+
+  const char *cycle = T9_CYCLES[idx];
+  if (!cycle) return;
+  int cycleLen = (int)strlen(cycle);
+
+  uint32_t now = millis();
+  bool cyclingSameKey = (idx == g_wifiT9LastBtnIdx) && (now - g_wifiT9LastPressMs < T9_CYCLE_TIMEOUT_MS);
+
+  if (cyclingSameKey) {
+    lv_textarea_del_char(wifi_pw_ta);
+    g_wifiT9CyclePos = (g_wifiT9CyclePos + 1) % cycleLen;
+  } else {
+    g_wifiT9CyclePos = 0;
+  }
+
+  lv_textarea_add_char(wifi_pw_ta, cycle[g_wifiT9CyclePos]);
+  g_wifiT9LastBtnIdx = idx;
+  g_wifiT9LastPressMs = now;
+}
+
+void wifiListSkipBtnEventCb(lv_event_t *e) {
+  g_wifiSetupConnected = false;
+  g_wifiSetupDone = true;
+}
+
+// Distinct from Skip: this is for when the setup screen was opened from the
+// chat screen's gear button while ALREADY connected (not just at boot with
+// nothing working yet) - "cancel" should restore whatever was previously
+// connected rather than force offline mode.
+void wifiListCancelBtnEventCb(lv_event_t *e) {
+  String ssid, pass;
+  if (loadSavedWifi(ssid, pass)) {
+    tryConnectWifi(ssid, pass, nullptr);
+  }
+  g_wifiSetupConnected = (WiFi.status() == WL_CONNECTED);
+  g_wifiSetupDone = true;
+}
+
+void wifiUpBtnEventCb(lv_event_t *e) {
+  if (g_wifiListCount <= 0) return;
+  g_wifiListIdx = (g_wifiListIdx - 1 + g_wifiListCount) % g_wifiListCount;
+  updateWifiListRows();
+}
+
+void wifiDownBtnEventCb(lv_event_t *e) {
+  if (g_wifiListCount <= 0) return;
+  g_wifiListIdx = (g_wifiListIdx + 1) % g_wifiListCount;
+  updateWifiListRows();
+}
+
+void wifiSelectBtnEventCb(lv_event_t *e) {
+  if (g_wifiListCount <= 0) return;
+  String ssid = WiFi.SSID(g_wifiListIdx);
+  bool isOpen = (WiFi.encryptionType(g_wifiListIdx) == WIFI_AUTH_OPEN);
+  if (isOpen) {
+    if (tryConnectWifi(ssid, "", nullptr)) {
+      saveWifi(ssid, "");
+      g_wifiSetupConnected = true;
+      g_wifiSetupDone = true;
+      return;
+    }
+    // fall through to password view if an "open" network unexpectedly
+    // still needs one (captive portals etc. aren't handled - offer manual entry)
+  }
+  showWifiPasswordView(ssid);
+}
+
+void createWifiSetupScreen() {
+  lv_obj_clean(lv_scr_act());
+  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x0f172a), 0);
+
+  lv_obj_t *title = lv_label_create(lv_scr_act());
+  lv_label_set_text(title, "Select a WiFi network");
+  lv_obj_set_style_text_color(title, lv_color_hex(0x22c55e), 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+  lv_refr_now(NULL); // paint the title before the blocking scan below
+
+  // Two columns, all standalone lv_btn/lv_obj widgets directly on the
+  // screen (same class of widget as gear/T9 keys, all of which have worked
+  // reliably) instead of many small buttons inside one shared container
+  // (which rendered fine but wouldn't reliably register clicks):
+  //   col 1 (wide, x=10..300): current SSID display, non-interactive
+  //   col 2 (x=310..470): Up / Select / Down / Back / Skip, stacked
+
+  // Only fully reset the radio before scanning if we're not already
+  // connected. A mid-chat "change WiFi" tap (the gear button) starts out
+  // already connected, and unconditionally forcing disconnect(true) + a 1s
+  // settle here was one of the suspects for touch going dead afterwards -
+  // scanning while connected is a normal supported ESP32 WiFi operation, no
+  // need to tear the radio down for it.
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.disconnect(true);
+    delay(1000); // full radio power-cycle from disconnect(true) needs this long to settle
+    WiFi.mode(WIFI_STA);
+    delay(100);
+  }
+
+  Serial.println("Scanning WiFi networks...");
+  int n = WiFi.scanNetworks();
+  Serial.printf("scanNetworks() returned %d\r\n", n);
+  g_wifiListCount = n > 0 ? n : 0;
+  g_wifiListIdx = 0;
+
+  // --- Column 1: the network list (7 visible rows, sliding window,
+  // highlighted row = current selection; see updateWifiListRows()).
+  // Full height from just under the title down to the screen bottom - the
+  // rows are display-only (Up/Down/Select do all the interaction), so
+  // unlike the buttons this box is allowed to extend up into the touch
+  // dead zone (y<110) without any downside. ---
+  wifi_current_box = lv_obj_create(lv_scr_act());
+  lv_obj_set_size(wifi_current_box, 290, 280);
+  lv_obj_align(wifi_current_box, LV_ALIGN_TOP_LEFT, 10, 35);
+  lv_obj_set_style_bg_color(wifi_current_box, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(wifi_current_box, 2, 0);
+  lv_obj_set_style_border_color(wifi_current_box, lv_color_hex(0x22c55e), 0); // green outline - same theme as input box/T9 keys
+  lv_obj_set_style_radius(wifi_current_box, 8, 0);
+  lv_obj_set_style_pad_all(wifi_current_box, 4, 0);
+  lv_obj_clear_flag(wifi_current_box, LV_OBJ_FLAG_SCROLLABLE);
+
+  // 7 rows x 36px + 6x 3px gaps = 270px inside the 280px box (with padding)
+  for (int i = 0; i < WIFI_LIST_VISIBLE_ROWS; i++) {
+    wifi_list_rows[i] = lv_obj_create(wifi_current_box);
+    lv_obj_set_size(wifi_list_rows[i], 274, 36);
+    lv_obj_set_pos(wifi_list_rows[i], 0, i * 39);
+    lv_obj_set_style_bg_color(wifi_list_rows[i], lv_color_hex(0x1e293b), 0);
+    lv_obj_set_style_border_width(wifi_list_rows[i], 1, 0);
+    lv_obj_set_style_border_color(wifi_list_rows[i], lv_color_hex(0x22c55e), 0); // same outline theme as T9 keys
+    lv_obj_set_style_radius(wifi_list_rows[i], 6, 0);
+    lv_obj_set_style_pad_all(wifi_list_rows[i], 0, 0);
+    lv_obj_clear_flag(wifi_list_rows[i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(wifi_list_rows[i], LV_OBJ_FLAG_CLICKABLE); // display-only; Select confirms
+
+    wifi_list_row_labels[i] = lv_label_create(wifi_list_rows[i]);
+    lv_obj_set_style_text_color(wifi_list_row_labels[i], lv_color_hex(0xffffff), 0);
+    lv_label_set_long_mode(wifi_list_row_labels[i], LV_LABEL_LONG_DOT);
+    lv_obj_set_width(wifi_list_row_labels[i], 258);
+    lv_obj_align(wifi_list_row_labels[i], LV_ALIGN_LEFT_MID, 8, 0);
+  }
+
+  if (n < 0) {
+    for (int i = 1; i < WIFI_LIST_VISIBLE_ROWS; i++) lv_obj_add_flag(wifi_list_rows[i], LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text_fmt(wifi_list_row_labels[0], "Scan failed (code %d)", n);
+  } else {
+    updateWifiListRows();
+  }
+
+  // --- Column 2: Up / Select / Down / Back / Skip, all stacked. 5 buttons
+  // in 202px -> 37px each with 4px gaps (5*37 + 4*4 = 201).
+  const int32_t WIFI_COL2_X = 310, WIFI_COL2_W = 160;
+  const int32_t WIFI_COL2_ROW_H = 37, WIFI_COL2_GAP = 4;
+  int32_t col2Y = 113;
+
+  wifi_up_btn = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(wifi_up_btn, WIFI_COL2_W, WIFI_COL2_ROW_H);
+  lv_obj_align(wifi_up_btn, LV_ALIGN_TOP_LEFT, WIFI_COL2_X, col2Y);
+  lv_obj_set_style_radius(wifi_up_btn, 10, 0);
+  lv_obj_set_style_bg_color(wifi_up_btn, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(wifi_up_btn, 1, 0);
+  lv_obj_set_style_border_color(wifi_up_btn, lv_color_hex(0x22c55e), 0); // same outline theme as T9 keys
+  lv_obj_add_event_cb(wifi_up_btn, wifiUpBtnEventCb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *up_label = lv_label_create(wifi_up_btn);
+  lv_label_set_text(up_label, LV_SYMBOL_UP);
+  lv_obj_center(up_label);
+  col2Y += WIFI_COL2_ROW_H + WIFI_COL2_GAP;
+
+  wifi_select_btn = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(wifi_select_btn, WIFI_COL2_W, WIFI_COL2_ROW_H);
+  lv_obj_align(wifi_select_btn, LV_ALIGN_TOP_LEFT, WIFI_COL2_X, col2Y);
+  lv_obj_set_style_radius(wifi_select_btn, 10, 0);
+  lv_obj_set_style_bg_color(wifi_select_btn, lv_color_hex(0x22c55e), 0);
+  lv_obj_add_event_cb(wifi_select_btn, wifiSelectBtnEventCb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *select_label = lv_label_create(wifi_select_btn);
+  lv_label_set_text(select_label, "Select");
+  lv_obj_center(select_label);
+  col2Y += WIFI_COL2_ROW_H + WIFI_COL2_GAP;
+
+  wifi_down_btn = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(wifi_down_btn, WIFI_COL2_W, WIFI_COL2_ROW_H);
+  lv_obj_align(wifi_down_btn, LV_ALIGN_TOP_LEFT, WIFI_COL2_X, col2Y);
+  lv_obj_set_style_radius(wifi_down_btn, 10, 0);
+  lv_obj_set_style_bg_color(wifi_down_btn, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(wifi_down_btn, 1, 0);
+  lv_obj_set_style_border_color(wifi_down_btn, lv_color_hex(0x22c55e), 0); // same outline theme as T9 keys
+  lv_obj_add_event_cb(wifi_down_btn, wifiDownBtnEventCb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *down_label = lv_label_create(wifi_down_btn);
+  lv_label_set_text(down_label, LV_SYMBOL_DOWN);
+  lv_obj_center(down_label);
+  col2Y += WIFI_COL2_ROW_H + WIFI_COL2_GAP;
+
+  // Cancel (reconnect to whatever was working before) / Skip (deliberately
+  // go offline) - distinct actions, see wifiListCancelBtnEventCb()'s
+  // comment for why they can't be the same button.
+  wifi_list_cancel_btn = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(wifi_list_cancel_btn, WIFI_COL2_W, WIFI_COL2_ROW_H);
+  lv_obj_align(wifi_list_cancel_btn, LV_ALIGN_TOP_LEFT, WIFI_COL2_X, col2Y);
+  lv_obj_set_style_radius(wifi_list_cancel_btn, 10, 0);
+  lv_obj_set_style_bg_color(wifi_list_cancel_btn, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(wifi_list_cancel_btn, 1, 0);
+  lv_obj_set_style_border_color(wifi_list_cancel_btn, lv_color_hex(0x22c55e), 0); // same outline theme as T9 keys
+  lv_obj_add_event_cb(wifi_list_cancel_btn, wifiListCancelBtnEventCb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *cancel_label = lv_label_create(wifi_list_cancel_btn);
+  lv_label_set_text(cancel_label, LV_SYMBOL_LEFT " Back");
+  lv_obj_center(cancel_label);
+  col2Y += WIFI_COL2_ROW_H + WIFI_COL2_GAP;
+
+  wifi_list_skip_btn = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(wifi_list_skip_btn, WIFI_COL2_W, WIFI_COL2_ROW_H);
+  lv_obj_align(wifi_list_skip_btn, LV_ALIGN_TOP_LEFT, WIFI_COL2_X, col2Y);
+  lv_obj_set_style_radius(wifi_list_skip_btn, 10, 0);
+  lv_obj_set_style_bg_color(wifi_list_skip_btn, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(wifi_list_skip_btn, 1, 0);
+  lv_obj_set_style_border_color(wifi_list_skip_btn, lv_color_hex(0x22c55e), 0); // same outline theme as T9 keys
+  lv_obj_add_event_cb(wifi_list_skip_btn, wifiListSkipBtnEventCb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *skip_label = lv_label_create(wifi_list_skip_btn);
+  lv_label_set_text(skip_label, "Skip");
+  lv_obj_center(skip_label);
+
+  // --- Password view - built here but hidden; showWifiPasswordView() and
+  // showWifiListView() toggle which view is visible without ever rebuilding
+  // either one. Same coordinates as the chat screen's typing mode / the
+  // list above (all field-tested clear of the dead zone).
+  wifi_pw_title = lv_label_create(lv_scr_act());
+  lv_label_set_text(wifi_pw_title, "Password for:");
+  lv_obj_set_style_text_color(wifi_pw_title, lv_color_hex(0x22c55e), 0);
+  lv_obj_align(wifi_pw_title, LV_ALIGN_TOP_MID, 0, 8);
+
+  wifi_pw_ta = lv_textarea_create(lv_scr_act());
+  lv_obj_set_size(wifi_pw_ta, 460, 40);
+  lv_obj_align(wifi_pw_ta, LV_ALIGN_TOP_MID, 0, 35);
+  lv_textarea_set_one_line(wifi_pw_ta, true);
+  lv_textarea_set_password_mode(wifi_pw_ta, false); // shown in plain text, not masked, per request
+  lv_textarea_set_placeholder_text(wifi_pw_ta, "Password");
+  lv_obj_set_style_radius(wifi_pw_ta, 16, 0);
+  lv_obj_set_style_border_width(wifi_pw_ta, 2, 0);
+  lv_obj_set_style_border_color(wifi_pw_ta, lv_color_hex(0x22c55e), 0);
+  lv_obj_set_style_bg_color(wifi_pw_ta, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_text_color(wifi_pw_ta, lv_color_hex(0xffffff), 0);
+
+  wifi_pw_status_label = lv_label_create(lv_scr_act());
+  lv_label_set_text(wifi_pw_status_label, "");
+  lv_obj_set_style_text_color(wifi_pw_status_label, lv_color_hex(0xffffff), 0);
+  lv_obj_align(wifi_pw_status_label, LV_ALIGN_TOP_MID, 0, 80);
+
+  wifi_pw_back_btn = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(wifi_pw_back_btn, 70, 202);
+  lv_obj_align(wifi_pw_back_btn, LV_ALIGN_TOP_RIGHT, -10, 113);
+  lv_obj_add_event_cb(wifi_pw_back_btn, wifiBackToListBtnEventCb, LV_EVENT_CLICKED, NULL);
+  lv_obj_set_style_radius(wifi_pw_back_btn, 16, 0);
+  lv_obj_set_style_bg_color(wifi_pw_back_btn, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(wifi_pw_back_btn, 1, 0);
+  lv_obj_set_style_border_color(wifi_pw_back_btn, lv_color_hex(0x22c55e), 0); // same outline theme as T9 keys
+  lv_obj_t *back_label = lv_label_create(wifi_pw_back_btn);
+  lv_label_set_text(back_label, LV_SYMBOL_LEFT "\nBack");
+  lv_obj_set_style_text_align(back_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_center(back_label);
+
+  wifi_pw_kb = lv_btnmatrix_create(lv_scr_act());
+  lv_btnmatrix_set_map(wifi_pw_kb, chat_t9_map);
+  lv_obj_add_event_cb(wifi_pw_kb, wifiPwKeypadEventCb, LV_EVENT_VALUE_CHANGED, NULL);
+  lv_obj_set_style_bg_opa(wifi_pw_kb, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(wifi_pw_kb, 0, 0);
+  lv_obj_set_style_pad_all(wifi_pw_kb, 4, 0);
+  lv_obj_set_style_pad_row(wifi_pw_kb, 6, 0);
+  lv_obj_set_style_pad_column(wifi_pw_kb, 6, 0);
+  lv_obj_set_style_radius(wifi_pw_kb, 10, LV_PART_ITEMS);
+  lv_obj_set_style_bg_color(wifi_pw_kb, lv_color_hex(0x1e293b), LV_PART_ITEMS);
+  lv_obj_set_style_border_width(wifi_pw_kb, 1, LV_PART_ITEMS);
+  lv_obj_set_style_border_color(wifi_pw_kb, lv_color_hex(0x22c55e), LV_PART_ITEMS);
+  lv_obj_set_style_text_color(wifi_pw_kb, lv_color_hex(0xffffff), LV_PART_ITEMS);
+  lv_obj_set_size(wifi_pw_kb, 380, 202);
+  lv_obj_align(wifi_pw_kb, LV_ALIGN_TOP_LEFT, 10, 113);
+
+  showWifiListView(); // start on the list view
+
+  // Without this, nothing built above reliably appeared until some later
+  // unrelated event happened to trigger a repaint - seen before with the
+  // per-item list too. Force it explicitly right after the long blocking
+  // WiFi.scanNetworks() call rather than hoping the next natural tick does it.
+  lv_obj_invalidate(lv_scr_act());
+  lv_refr_now(NULL);
+}
+
+// Blocking, like runTouchCalibration(): shows the setup screen and keeps
+// LVGL ticking until a network connects successfully or the user skips.
+// List <-> password view switching happens inside the button handlers
+// above (show/hide, no rebuild) without touching g_wifiSetupDone.
+bool runWifiSetupFlow() {
+  // createChatScreen() always runs before this (boot fallback or the gear
+  // button), so its header timer is always active at this point. Left
+  // running, it would keep firing every 2s and writing into
+  // chat_time_label/chat_wifi_label - destroyed by the lv_obj_clean() below
+  // but the global pointers don't get nulled out, so that write lands on
+  // freed memory.
+  if (g_chatHeaderTimer) {
+    lv_timer_del(g_chatHeaderTimer);
+    g_chatHeaderTimer = nullptr;
+  }
+
+  g_wifiSetupDone = false;
+  g_wifiSetupConnected = false;
+  createWifiSetupScreen();
+  while (!g_wifiSetupDone) {
+    lv_timer_handler();
+    delay(15);
+  }
+  return g_wifiSetupConnected;
+}
 
 /* 显示器刷新 */
 void my_disp_flush( lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p )
@@ -1495,22 +1965,38 @@ void setup()
   // Create the chat UI first (show immediately)
   Serial.println("Creating chat screen...");
   createChatScreen();
-  
+
   // Force initial display refresh
   lv_refr_now(NULL);
   Serial.println("Initial display created");
-  
-  // connectToWiFi() blocks for several seconds (network scan + connect
-  // attempts) with no screen updates of its own, which can look like the
-  // device hung right after calibration. Show status on the chat screen
-  // (already visible at this point) so it's clear something's happening.
-  lv_label_set_text(chat_response_label, "Connecting to WiFi...");
-  lv_refr_now(NULL);
-  Serial.println("Connecting to WiFi...");
-  connectToWiFi();
+
+  // WiFi: try creds saved in NVS from a previous on-device setup first; if
+  // none are saved (first boot) or they no longer work, fall back to
+  // secrets.h once as a legacy convenience, then finally show the
+  // scan-and-tap setup screen (see runWifiSetupFlow()) rather than requiring
+  // a reflash to change networks.
+  bool wifiConnected = false;
+  String savedSsid, savedPass;
+  if (loadSavedWifi(savedSsid, savedPass)) {
+    lv_label_set_text(chat_response_label, "Connecting to saved WiFi...");
+    lv_refr_now(NULL);
+    wifiConnected = tryConnectWifi(savedSsid, savedPass, chat_response_label);
+  }
+  if (!wifiConnected && strlen(WIFI_SSID) > 0) {
+    lv_label_set_text(chat_response_label, "Connecting to WiFi...");
+    lv_refr_now(NULL);
+    wifiConnected = tryConnectWifi(WIFI_SSID, WIFI_PASSWORD, chat_response_label);
+    if (wifiConnected) saveWifi(WIFI_SSID, WIFI_PASSWORD); // adopt it into NVS going forward
+  }
+  if (!wifiConnected) {
+    Serial.println("No working saved WiFi - starting on-device setup...");
+    wifiConnected = runWifiSetupFlow();
+    createChatScreen(); // the setup screens overwrote the chat UI - rebuild it
+    lv_refr_now(NULL);
+  }
 
   // Configure time only if WiFi is connected
-  if (WiFi.status() == WL_CONNECTED) {
+  if (wifiConnected) {
     Serial.println("Configuring time...");
     configTime(GMT_OFFSET, DAYLIGHT_OFFSET, NTP_SERVER);
     lv_label_set_text(chat_response_label, "Connected! Ask me anything.");
@@ -1519,7 +2005,7 @@ void setup()
     lv_label_set_text(chat_response_label, "No WiFi - couldn't reach Gemini. Ask me anything once connected.");
   }
   lv_refr_now(NULL);
-  
+
   Serial.println( "Setup done - IP Display should be running" );
 }
 
@@ -1532,6 +2018,30 @@ void loop()
   // needlessly halved the effective poll rate and made the keyboard feel
   // laggy.
   lv_timer_handler(); /* 让GUI完成它的工作 */
+
+  // changeWifiFromChatBtnEventCb() (the chat screen's gear button) only
+  // sets this flag rather than calling runWifiSetupFlow() directly, because
+  // that button's own click handler runs SYNCHRONOUSLY INSIDE the
+  // lv_timer_handler() call above (LVGL dispatches the click as part of
+  // indev processing). runWifiSetupFlow() has its own internal loop that
+  // also calls lv_timer_handler() - calling it while already inside a
+  // lv_timer_handler() call is a reentrant call LVGL isn't designed for,
+  // and corrupts its indev press/release tracking. That's almost certainly
+  // why every WiFi-setup-screen button stayed unresponsive no matter how
+  // the screen was built (list, picker, scrollable or not) - it was never
+  // about the widgets, it was about calling into LVGL from the wrong place.
+  // Handling the request here instead means runWifiSetupFlow() only ever
+  // runs from this top-level, non-nested call site.
+  if (g_wifiSetupRequested) {
+    g_wifiSetupRequested = false;
+    bool connected = runWifiSetupFlow();
+    createChatScreen(); // the setup screens overwrote the chat UI - rebuild it
+    lv_refr_now(NULL);
+    lv_label_set_text(chat_response_label,
+                       connected ? "WiFi updated! Ask me anything."
+                                 : "Still offline - ask me anything once connected.");
+  }
+
   delay( 10 );
 }
 /*
