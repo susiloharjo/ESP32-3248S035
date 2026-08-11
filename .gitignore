@@ -1,7 +1,8 @@
 examples/*/*
 !examples/arduino/**/*.{c,cpp,h,hpp}
 !examples/arduino/**/Makefile
-!examples/platformio/**
+!examples/gemini-chatbot/**
+!examples/andon-system/**
 
 **/.vscode/
 **/*.code-workspace
