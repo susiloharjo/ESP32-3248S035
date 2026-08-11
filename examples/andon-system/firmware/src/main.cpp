@@ -585,7 +585,12 @@ enum AndonScreenId {
   SCR_QUEUED_OFFLINE,
   SCR_ACKNOWLEDGED, // covers both "on the way" and "handling" sub-states
   SCR_RESOLVED,
+  SCR_UPDATE_PRODUCTION, // operator-facing counter to log pipes completed
 };
+
+// Work order target stays fixed - only the completed count is editable from
+// the terminal (see showScreenUpdateProduction()).
+#define PRODUCTION_TARGET 120
 
 struct AndonState {
   AndonScreenId screen = SCR_NORMAL;
@@ -595,6 +600,7 @@ struct AndonState {
   bool handling = false;     // false = "on the way", true = "issue being handled"
   uint32_t downtimeSec = 0;  // frozen at resolve time for SCR-06's summary
   bool mockConnected = true; // dev-toggleable fake connectivity (long-press header)
+  int productionCount = 72;  // TODO(backend): synced from the line, not operator-owned truth
 };
 static AndonState g_andon;
 
@@ -612,6 +618,12 @@ static lv_obj_t *g_content = nullptr; // rebuilt per screen; header stays put
 static lv_obj_t *g_elapsedLabel = nullptr;
 static lv_obj_t *g_waitLabel = nullptr;
 
+// SCR_UPDATE_PRODUCTION's counter - edited value lives here, separate from
+// g_andon.productionCount, so CANCEL can discard it without touching the
+// committed count.
+static lv_obj_t *g_productionCounterLabel = nullptr;
+static int g_productionEditValue = 0;
+
 static void showScreenNormal();
 static void showScreenCategory();
 static void showScreenReason(int8_t categoryIdx);
@@ -619,6 +631,7 @@ static void showScreenActive();
 static void showScreenQueuedOffline();
 static void showScreenAcknowledged();
 static void showScreenResolved();
+static void showScreenUpdateProduction();
 static void updateHeaderConnDot();
 
 //------------------------------------------------------------------------------
@@ -875,6 +888,7 @@ static void buildContent() {
 static void clearContent() {
   g_elapsedLabel = nullptr;
   g_waitLabel = nullptr;
+  g_productionCounterLabel = nullptr;
   lv_obj_clean(g_content);
 }
 
@@ -968,6 +982,37 @@ static void showConfirmDialog(const char *title, const char *message,
 // Event handlers / backend-integration stubs
 //------------------------------------------------------------------------------
 static void onNeedAssistance(lv_event_t *e) { showScreenCategory(); }
+
+static void onOpenUpdateProduction(lv_event_t *e) {
+  g_productionEditValue = g_andon.productionCount; // edit a scratch copy so CANCEL can discard it
+  showScreenUpdateProduction();
+}
+
+static void refreshProductionCounterLabel() {
+  if (!g_productionCounterLabel) return;
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d", g_productionEditValue);
+  lv_label_set_text(g_productionCounterLabel, buf);
+}
+
+static void onProductionMinus(lv_event_t *e) {
+  if (g_productionEditValue > 0) g_productionEditValue--;
+  refreshProductionCounterLabel();
+}
+
+static void onProductionPlus(lv_event_t *e) {
+  g_productionEditValue++;
+  refreshProductionCounterLabel();
+}
+
+static void onProductionCancel(lv_event_t *e) { showScreenNormal(); } // discards g_productionEditValue
+
+// TODO(backend): replace with MQTT publish/HTTP call to report the updated
+// production count once there's somewhere to send it.
+static void onProductionConfirm(lv_event_t *e) {
+  g_andon.productionCount = g_productionEditValue;
+  showScreenNormal();
+}
 static void onCategoryCancel(lv_event_t *e) { showScreenNormal(); }
 static void onReasonBack(lv_event_t *e) { showScreenCategory(); }
 static void onOfflineCancel(lv_event_t *e); // fwd - defined after cancelRequest()
@@ -1007,9 +1052,14 @@ static void onReasonSend(lv_event_t *e) {
 
 // TODO(backend): replace with MQTT publish to andon/v1/.../cancel
 static void cancelRequest() {
+  // Only the incident-flow fields reset here - connectivity and the
+  // production tally aren't part of the incident, so both would otherwise
+  // silently snap back to their defaults on every cancel.
   bool wasConnected = g_andon.mockConnected;
+  int production = g_andon.productionCount;
   g_andon = AndonState();
   g_andon.mockConnected = wasConnected;
+  g_andon.productionCount = production;
   showScreenNormal();
 }
 
@@ -1063,8 +1113,10 @@ static void closeSuccessTimerCb(lv_timer_t *timer) {
 // TODO(backend): replace with MQTT publish to andon/v1/.../confirm-run
 static void onConfirmRun(lv_event_t *e) {
   bool wasConnected = g_andon.mockConnected;
+  int production = g_andon.productionCount;
   g_andon = AndonState();
   g_andon.mockConnected = wasConnected;
+  g_andon.productionCount = production;
 
   // design.md SS7 SCR-06: "show a two-second success state, then return to
   // SCR-01" - not a real screen enum, just a transient checkmark.
@@ -1097,13 +1149,75 @@ static void showScreenNormal() {
   }
 
   // One card, 3 columns (was 3 separate boxes) - matches the reference layout.
+  char productionText[16];
+  snprintf(productionText, sizeof(productionText), "%d / %d", g_andon.productionCount, PRODUCTION_TARGET);
   makeMetricCard3(g_content, MARGIN, 78, CONTENT_W - 2 * MARGIN, 124,
                    LV_SYMBOL_LIST, "WORK ORDER", "WO-240811-07",
-                   LV_SYMBOL_DRIVE, "PRODUCTION", "72 / 120",
+                   LV_SYMBOL_DRIVE, "PRODUCTION", productionText,
                    LV_SYMBOL_CHARGE, "RATE", "18 pcs/h");
 
-  makeButton(g_content, MARGIN, 210, CONTENT_W - 2 * MARGIN, 62, COLOR_INFO,
-             LV_SYMBOL_BELL "  NEED ASSISTANCE", &lv_font_montserrat_20, onNeedAssistance, nullptr);
+  // UPDATE PRODUCTION : NEED ASSISTANCE is a 2:1 width split (was
+  // NEED ASSISTANCE alone, full width).
+  int unit = (CONTENT_W - 2 * MARGIN - GAP) / 3;
+  int updateW = unit * 2;
+  int assistW = unit;
+  makeButton(g_content, MARGIN, 210, updateW, 62, COLOR_MATERIAL,
+             LV_SYMBOL_EDIT "  UPDATE PRODUCTION", &lv_font_montserrat_16, onOpenUpdateProduction, nullptr);
+  // Amber, not red - red is reserved for "there's an active fault" states
+  // elsewhere (MAINTENANCE CALLED banner, STATUS: OPEN, etc.); using it here
+  // too would make this entry point look like a fault already exists before
+  // the operator has even tapped it.
+  makeButton(g_content, MARGIN + updateW + GAP, 210, assistW, 62, COLOR_WAITING,
+             LV_SYMBOL_BELL "  NEED\nASSISTANCE", &lv_font_montserrat_14, onNeedAssistance, nullptr);
+}
+
+// Update production count - reached from SCR-01's UPDATE PRODUCTION button.
+// Not one of design.md's numbered screens (this is new scope, see the
+// morning's conversation) but follows the same "no typing" philosophy as
+// the rest of the flow: a big counter plus +/- steppers instead of a
+// keyboard. Tap = +/-1; hold (LV_EVENT_LONG_PRESSED_REPEAT, built into
+// LVGL's indev - no custom repeat timer needed) auto-repeats for fast
+// adjustment over a larger range.
+static void showScreenUpdateProduction() {
+  clearContent();
+
+  lv_obj_t *title = lv_label_create(g_content);
+  lv_label_set_text(title, "UPDATE PRODUCTION");
+  lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT_PRIMARY), 0);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+
+  lv_obj_t *subtitle = lv_label_create(g_content);
+  char subtitleText[32];
+  snprintf(subtitleText, sizeof(subtitleText), "Target: %d pipes", PRODUCTION_TARGET);
+  lv_label_set_text(subtitle, subtitleText);
+  lv_obj_set_style_text_color(subtitle, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
+  lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
+  lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 38);
+
+  const int rowY = 66, rowH = 120, sideW = 100;
+  lv_obj_t *minusBtn = makeButton(g_content, MARGIN, rowY, sideW, rowH, COLOR_BG_RAISED,
+                                   LV_SYMBOL_MINUS, &lv_font_montserrat_28, onProductionMinus, nullptr);
+  lv_obj_add_event_cb(minusBtn, onProductionMinus, LV_EVENT_LONG_PRESSED_REPEAT, nullptr);
+
+  lv_obj_t *plusBtn = makeButton(g_content, CONTENT_W - MARGIN - sideW, rowY, sideW, rowH, COLOR_BG_RAISED,
+                                  LV_SYMBOL_PLUS, &lv_font_montserrat_28, onProductionPlus, nullptr);
+  lv_obj_add_event_cb(plusBtn, onProductionPlus, LV_EVENT_LONG_PRESSED_REPEAT, nullptr);
+
+  g_productionCounterLabel = lv_label_create(g_content);
+  lv_obj_set_style_text_color(g_productionCounterLabel, lv_color_hex(COLOR_TEXT_PRIMARY), 0);
+  lv_obj_set_style_text_font(g_productionCounterLabel, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_align(g_productionCounterLabel, LV_TEXT_ALIGN_CENTER, 0);
+  int counterX = MARGIN + sideW + GAP;
+  lv_obj_set_width(g_productionCounterLabel, CONTENT_W - 2 * (MARGIN + sideW + GAP));
+  lv_obj_set_pos(g_productionCounterLabel, counterX, rowY + (rowH - 56) / 2);
+  refreshProductionCounterLabel();
+
+  int halfW = (CONTENT_W - 2 * MARGIN - GAP) / 2;
+  makeButton(g_content, MARGIN, 210, halfW, 56, COLOR_DISABLED,
+             LV_SYMBOL_LEFT "  CANCEL", &lv_font_montserrat_18, onProductionCancel, nullptr);
+  makeButton(g_content, MARGIN + halfW + GAP, 210, halfW, 56, COLOR_RUNNING,
+             LV_SYMBOL_OK "  CONFIRM", &lv_font_montserrat_18, onProductionConfirm, nullptr);
 }
 
 // SCR-02 - Category selection
