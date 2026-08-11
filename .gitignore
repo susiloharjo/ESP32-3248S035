@@ -3,6 +3,7 @@ examples/*/*
 !examples/arduino/**/Makefile
 !examples/gemini-chatbot/**
 !examples/andon-system/**
+!examples/demo-hub/**
 
 **/.vscode/
 **/*.code-workspace
