@@ -5,12 +5,12 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h> // NVS storage for the on-device WiFi manager
+#include <SPI.h>
+#include <SD.h> // TF/micro-SD card slot - see sdLoadWifiNetworks()/sdSaveWifiNetwork()
 #include "esp_system.h" // esp_reset_reason() - TEMP/DEBUG, see setup()
 
 #include <lvgl.h>
 #include <TFT_eSPI.h>
-
-#include <demos/lv_demos.h>
 
 #include "secrets.h"
 //********************************************************************************************//
@@ -817,6 +817,7 @@ void lv_example_btn(void)
 // (Old hardcoded-credentials connectToWiFi() removed - replaced by the
 // NVS-backed on-device WiFi manager further down: loadSavedWifi(),
 // tryConnectWifi(), runWifiSetupFlow(), wired up in setup().)
+bool tryConnectWifi(const String &ssid, const String &pass, lv_obj_t *statusLabel); // fwd decl - connectToAnySavedWifi() (defined above it) needs this
 
 // (Weather dashboard/fetch code removed - this build is chat-only: keyboard +
 // input box + Gemini reply. See createChatScreen() below.)
@@ -1063,35 +1064,56 @@ void chatTextareaEventCb(lv_event_t *e) {
 // hand in t9KeypadEventCb() below instead.
 // ---------------------------------------------------------------------------
 
-// Grid order: 1 2 3 / 4 5 6 / 7 8 9 / <BACKSPACE> 0 <SEND>. Each entry is
-// every character that digit's key cycles through on repeated taps within
-// T9_CYCLE_TIMEOUT_MS (last char in each string is the digit itself, so you
-// can still reach a literal digit by tapping through the whole cycle).
-// NULL entries (backspace/send) are handled as special cases, not cycled.
-static const char * T9_CYCLES[12] = {
-  ".,!?1", "abc2", "def3",
-  "ghi4",  "jkl5", "mno6",
-  "pqrs7", "tuv8", "wxyz9",
-  NULL,    " 0",   NULL,
+// Grid order: 1 2 3 / 4 5 6 / 7 8 9 / <BACKSPACE> 0 <SHIFT> <SEND>. Each
+// entry is every character that digit's key cycles through on repeated taps
+// within T9_CYCLE_TIMEOUT_MS (last char in each string is the digit itself,
+// so you can still reach a literal digit by tapping through the whole
+// cycle). NULL entries (backspace/shift/send) are handled as special cases,
+// not cycled. "-" lives on the 1 key alongside the other punctuation rather
+// than getting its own key - the grid has no free slot for it, and it's
+// mainly needed for WiFi passwords (this map is shared with wifi_pw_kb),
+// not everyday chat typing.
+static const char * T9_CYCLES[13] = {
+  ".,!?-1", "abc2", "def3",
+  "ghi4",   "jkl5", "mno6",
+  "pqrs7",  "tuv8", "wxyz9",
+  NULL,     " 0",   NULL,    NULL,
 };
 static const int T9_BACKSPACE_IDX = 9;
-static const int T9_SEND_IDX = 11;
+static const int T9_SHIFT_IDX = 11;
+static const int T9_SEND_IDX = 12;
 static const uint32_t T9_CYCLE_TIMEOUT_MS = 600;
 
 // Each button shows its digit and letters on two lines, e.g. "2\nabc" -
 // safe to embed a literal newline inside a label like this because
 // lv_btnmatrix only treats an array element that IS "\n" (via strcmp) as a
 // row break, not one that merely contains one (confirmed in lv_btnmatrix.c).
-static const char * chat_t9_map[] = {
-  "1\n.,!?", "2\nabc", "3\ndef", "\n",
-  "4\nghi",  "5\njkl", "6\nmno", "\n",
-  "7\npqrs", "8\ntuv", "9\nwxyz", "\n",
-  LV_SYMBOL_BACKSPACE, "0\n_", LV_SYMBOL_OK, "",
+// Two variants so the on-screen letters actually flip case when Shift is
+// toggled (not just the Shift key's own highlight) - t9KeypadEventCb() /
+// wifiPwKeypadEventCb() swap the active widget's map via
+// lv_btnmatrix_set_map() when Shift is pressed. Typed characters were
+// always cased correctly even before this (see the ch-'a'+'A' logic below);
+// only the button labels were stuck lowercase.
+static const char * chat_t9_map_lower[] = {
+  "1\n.,!?-", "2\nabc", "3\ndef", "\n",
+  "4\nghi",   "5\njkl", "6\nmno", "\n",
+  "7\npqrs",  "8\ntuv", "9\nwxyz", "\n",
+  LV_SYMBOL_BACKSPACE, "0\n_", LV_SYMBOL_UP, LV_SYMBOL_OK, "",
 };
+static const char * chat_t9_map_upper[] = {
+  "1\n.,!?-", "2\nABC", "3\nDEF", "\n",
+  "4\nGHI",   "5\nJKL", "6\nMNO", "\n",
+  "7\nPQRS",  "8\nTUV", "9\nWXYZ", "\n",
+  LV_SYMBOL_BACKSPACE, "0\n_", LV_SYMBOL_UP, LV_SYMBOL_OK, "",
+};
+// Kept as the name used at widget-creation time (lv_btnmatrix_set_map(...,
+// chat_t9_map)) - always the lowercase variant; shift swaps away from it.
+static const char ** chat_t9_map = chat_t9_map_lower;
 
 int g_t9LastBtnIdx = -1;
 int g_t9CyclePos = 0;
 uint32_t g_t9LastPressMs = 0;
+bool g_t9ShiftOn = false;
 
 void t9KeypadEventCb(lv_event_t *e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
@@ -1109,6 +1131,18 @@ void t9KeypadEventCb(lv_event_t *e) {
     sendChatMessage(NULL);
     return;
   }
+  if (idx == T9_SHIFT_IDX) {
+    // Persistent toggle (not one-shot) - stays on until tapped again, shown
+    // both by the Shift key's own CHECKED highlight and by swapping the
+    // whole map so the letter buttons visibly read ABC instead of abc.
+    // Doesn't touch g_t9LastBtnIdx, so it doesn't interrupt whatever
+    // letter-cycle was in progress.
+    g_t9ShiftOn = !g_t9ShiftOn;
+    lv_btnmatrix_set_map(btnm, g_t9ShiftOn ? chat_t9_map_upper : chat_t9_map_lower);
+    lv_btnmatrix_set_btn_ctrl(btnm, idx, LV_BTNMATRIX_CTRL_CHECKED);
+    if (!g_t9ShiftOn) lv_btnmatrix_clear_btn_ctrl(btnm, idx, LV_BTNMATRIX_CTRL_CHECKED);
+    return;
+  }
 
   const char *cycle = T9_CYCLES[idx];
   if (!cycle) return;
@@ -1124,7 +1158,9 @@ void t9KeypadEventCb(lv_event_t *e) {
     g_t9CyclePos = 0; // different key, or timed out - start a new letter
   }
 
-  lv_textarea_add_char(chat_input_ta, cycle[g_t9CyclePos]);
+  char ch = cycle[g_t9CyclePos];
+  if (g_t9ShiftOn && ch >= 'a' && ch <= 'z') ch = ch - 'a' + 'A';
+  lv_textarea_add_char(chat_input_ta, ch);
   g_t9LastBtnIdx = idx;
   g_t9LastPressMs = now;
 }
@@ -1261,18 +1297,37 @@ void createChatScreen() {
   lv_obj_set_style_border_width(chat_kb, 1, LV_PART_ITEMS);
   lv_obj_set_style_border_color(chat_kb, lv_color_hex(0x22c55e), LV_PART_ITEMS);
   lv_obj_set_style_text_color(chat_kb, lv_color_hex(0xffffff), LV_PART_ITEMS);
+  // Shift key's "on" indicator - lv_btnmatrix's own CHECKED state (toggled
+  // in t9KeypadEventCb()), styled as a solid green fill so it's obviously
+  // different from the other keys' dark fill while active.
+  lv_obj_set_style_bg_color(chat_kb, lv_color_hex(0x22c55e), LV_PART_ITEMS | LV_STATE_CHECKED);
+  lv_obj_set_style_text_color(chat_kb, lv_color_hex(0x0f172a), LV_PART_ITEMS | LV_STATE_CHECKED);
   lv_obj_add_flag(chat_kb, LV_OBJ_FLAG_HIDDEN);
 }
 
 // ---------------------------------------------------------------------------
 // On-device WiFi manager: scan for networks, pick one by tapping, type its
 // password on the same T9 keypad the chat screen uses, and save the result
-// to NVS (via Preferences) so it's remembered across reboots/reflashes -
-// no more hardcoding SSID/password in secrets.h and reflashing to change
-// networks. Runs once at boot, blocking (same lv_timer_handler()+delay()
-// polling pattern as runTouchCalibration()), before the chat screen is
-// built. Layout reuses the exact coordinates already proven safe on this
-// panel's touch dead zone (see setChatTypingMode()'s comments).
+// so it's remembered across reboots/reflashes - no more hardcoding
+// SSID/password in secrets.h and reflashing to change networks. Runs once
+// at boot, blocking (same lv_timer_handler()+delay() polling pattern as
+// runTouchCalibration()), before the chat screen is built. Layout reuses
+// the exact coordinates already proven safe on this panel's touch dead
+// zone (see setChatTypingMode()'s comments).
+//
+// Two storage tiers:
+//  - NVS (Preferences) - always available, holds exactly one network. The
+//    original mechanism, kept as the fallback for boards with no SD card
+//    inserted (or as a safety net if the SD write below fails).
+//  - TF/micro-SD card - the board's TF slot (see docs/pcb-layout.jpg: TF_CS
+//    IO5, MOSI IO23, MISO IO19, CLK IO18 - the ESP32's default VSPI pins,
+//    so no custom SPI.begin() is needed) holds up to
+//    MAX_SAVED_WIFI_NETWORKS entries as plain "ssid,password" lines in
+//    /wifi_networks.csv - closer to how a phone/laptop remembers many
+//    networks. NOTE: stored in plain text on removable media - anyone who
+//    pulls the card can read every saved password on a PC. Accepted
+//    tradeoff for this project; don't reuse this pattern somewhere that
+//    needs real credential protection.
 // ---------------------------------------------------------------------------
 
 Preferences g_wifiPrefs;
@@ -1290,6 +1345,123 @@ void saveWifi(const String &ssid, const String &pass) {
   g_wifiPrefs.putString("ssid", ssid);
   g_wifiPrefs.putString("pass", pass);
   g_wifiPrefs.end();
+}
+
+#define TF_CS 5
+#define WIFI_CSV_PATH "/wifi_networks.csv"
+#define MAX_SAVED_WIFI_NETWORKS 8
+bool g_sdReady = false;
+
+struct WifiEntry { String ssid; String pass; };
+
+// Reads every saved entry from the SD card into out[] (caller-provided,
+// size >= maxCount). Returns how many were found - 0 if the SD card isn't
+// ready or the file doesn't exist yet, which callers treat as "no SD
+// entries" rather than an error (falls back to the NVS single entry).
+int sdLoadWifiNetworks(WifiEntry out[], int maxCount) {
+  if (!g_sdReady) return 0;
+  File f = SD.open(WIFI_CSV_PATH, FILE_READ);
+  if (!f) return 0;
+  int count = 0;
+  while (f.available() && count < maxCount) {
+    String line = f.readStringUntil('\n');
+    line.trim(); // drop trailing \r left by readStringUntil('\n') on CRLF lines
+    if (line.length() == 0) continue;
+    int comma = line.indexOf(',');
+    if (comma < 0) continue;
+    out[count].ssid = line.substring(0, comma);
+    out[count].pass = line.substring(comma + 1);
+    count++;
+  }
+  f.close();
+  return count;
+}
+
+// Adds/updates one entry and rewrites the whole file. Simplest correct
+// approach for a list this small (<= MAX_SAVED_WIFI_NETWORKS) written only
+// on a successful new-network connect, not worth a more clever in-place
+// edit. SD.open(..., FILE_WRITE) on the ESP32 core APPENDS rather than
+// truncating, so the old file is removed first.
+void sdSaveWifiNetwork(const String &ssid, const String &pass) {
+  if (!g_sdReady) return;
+  WifiEntry entries[MAX_SAVED_WIFI_NETWORKS];
+  int count = sdLoadWifiNetworks(entries, MAX_SAVED_WIFI_NETWORKS);
+
+  int existing = -1;
+  for (int i = 0; i < count; i++) {
+    if (entries[i].ssid == ssid) { existing = i; break; }
+  }
+  if (existing >= 0) {
+    entries[existing].pass = pass;
+  } else if (count < MAX_SAVED_WIFI_NETWORKS) {
+    entries[count].ssid = ssid;
+    entries[count].pass = pass;
+    count++;
+  } else {
+    // Full - drop the oldest (front of the list), append the newest.
+    for (int i = 1; i < MAX_SAVED_WIFI_NETWORKS; i++) entries[i - 1] = entries[i];
+    entries[MAX_SAVED_WIFI_NETWORKS - 1] = {ssid, pass};
+  }
+
+  SD.remove(WIFI_CSV_PATH);
+  File f = SD.open(WIFI_CSV_PATH, FILE_WRITE);
+  if (!f) {
+    Serial.println("SD: failed to open " WIFI_CSV_PATH " for writing");
+    return;
+  }
+  for (int i = 0; i < count; i++) {
+    f.print(entries[i].ssid);
+    f.print(',');
+    f.println(entries[i].pass);
+  }
+  f.close();
+}
+
+// Saves to both tiers: the SD list (no-op if no card) so multiple networks
+// are remembered, and NVS (always) so there's still a working fallback on
+// boards without a card inserted.
+void persistWifiCredential(const String &ssid, const String &pass) {
+  sdSaveWifiNetwork(ssid, pass);
+  saveWifi(ssid, pass);
+}
+
+// Tries every SD-saved network that's actually in range (a fresh scan,
+// matched by SSID), strongest signal first - phone/laptop-like "best known
+// network wins" rather than just file order. Falls back to the single
+// NVS-saved network if the SD card isn't ready, its list is empty, or none
+// of its entries were in range. Used both at boot and by the chat screen's
+// "Cancel" (reconnect) button.
+bool connectToAnySavedWifi(lv_obj_t *statusLabel) {
+  WifiEntry entries[MAX_SAVED_WIFI_NETWORKS];
+  int count = sdLoadWifiNetworks(entries, MAX_SAVED_WIFI_NETWORKS);
+
+  if (count > 0) {
+    if (statusLabel) {
+      lv_label_set_text(statusLabel, "Scanning for saved networks...");
+      lv_refr_now(NULL);
+    }
+    int n = WiFi.scanNetworks();
+    int bestEntry = -1, bestRssi = -1000;
+    for (int i = 0; i < n; i++) {
+      for (int j = 0; j < count; j++) {
+        if (WiFi.SSID(i) == entries[j].ssid && WiFi.RSSI(i) > bestRssi) {
+          bestRssi = WiFi.RSSI(i);
+          bestEntry = j;
+        }
+      }
+    }
+    if (bestEntry >= 0 && tryConnectWifi(entries[bestEntry].ssid, entries[bestEntry].pass, statusLabel)) {
+      return true;
+    }
+    // None of the SD entries were in range (or none connected) - fall
+    // through to the NVS single entry as a last resort.
+  }
+
+  String ssid, pass;
+  if (loadSavedWifi(ssid, pass)) {
+    return tryConnectWifi(ssid, pass, statusLabel);
+  }
+  return false;
 }
 
 // Blocking connect attempt (up to ~10s), updating statusLabel (if given)
@@ -1351,6 +1523,7 @@ void gt911_int_(); // fwd decl - defined near the bottom of the file
 // which is safe: the earlier unresponsive-list problem turned out to be the
 // nested lv_timer_handler() call (see loop()), not child widgets.
 #define WIFI_LIST_VISIBLE_ROWS 7
+lv_obj_t * wifi_list_title = nullptr;    // "Select a WiFi network" - hide/show target
 lv_obj_t * wifi_current_box = nullptr;   // bordered container - hide/show target
 lv_obj_t * wifi_list_rows[WIFI_LIST_VISIBLE_ROWS] = {nullptr};   // row background objects
 lv_obj_t * wifi_list_row_labels[WIFI_LIST_VISIBLE_ROWS] = {nullptr}; // their text labels
@@ -1366,12 +1539,23 @@ lv_obj_t * wifi_pw_title = nullptr;
 lv_obj_t * wifi_pw_ta = nullptr;
 lv_obj_t * wifi_pw_status_label = nullptr;
 lv_obj_t * wifi_pw_back_btn = nullptr;
+lv_obj_t * wifi_pw_symbols_btn = nullptr; // top half of what used to be one tall Back button
 lv_obj_t * wifi_pw_kb = nullptr;
 String g_wifiSetupSsid = "";
 
 int g_wifiT9LastBtnIdx = -1;
 int g_wifiT9CyclePos = 0;
 uint32_t g_wifiT9LastPressMs = 0;
+
+// Symbols key: standalone button (not part of the T9 btnmatrix/T9_CYCLES -
+// it lives outside the keypad grid, in the space freed up by shrinking
+// wifi_pw_back_btn), but cycles on repeated taps the same way a T9 key
+// does. Password-oriented set that doesn't already live on T9 key "1"
+// (".,!?-") - common special characters password policies ask for.
+static const char * WIFI_SYMBOLS_CYCLE = "@#$%^&*-_";
+int g_wifiSymCyclePos = 0;
+uint32_t g_wifiSymLastPressMs = 0;
+bool g_wifiT9ShiftOn = false;
 
 void updateWifiListRows() {
   if (g_wifiListCount <= 0) {
@@ -1409,6 +1593,7 @@ void updateWifiListRows() {
 }
 
 void showWifiListView() {
+  lv_obj_clear_flag(wifi_list_title, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(wifi_current_box, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(wifi_up_btn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(wifi_select_btn, LV_OBJ_FLAG_HIDDEN);
@@ -1418,6 +1603,7 @@ void showWifiListView() {
   lv_obj_add_flag(wifi_pw_title, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(wifi_pw_ta, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(wifi_pw_status_label, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(wifi_pw_symbols_btn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(wifi_pw_back_btn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(wifi_pw_kb, LV_OBJ_FLAG_HIDDEN);
 }
@@ -1425,10 +1611,20 @@ void showWifiListView() {
 void showWifiPasswordView(const String &ssid) {
   g_wifiSetupSsid = ssid;
   g_wifiT9LastBtnIdx = -1;
+  g_wifiT9ShiftOn = false;
+  g_wifiSymCyclePos = 0;
+  g_wifiSymLastPressMs = 0;
+  lv_btnmatrix_set_map(wifi_pw_kb, chat_t9_map_lower);
+  lv_btnmatrix_clear_btn_ctrl(wifi_pw_kb, T9_SHIFT_IDX, LV_BTNMATRIX_CTRL_CHECKED);
   lv_label_set_text_fmt(wifi_pw_title, "Password for: %s", ssid.c_str());
   lv_textarea_set_text(wifi_pw_ta, "");
   lv_label_set_text(wifi_pw_status_label, "");
 
+  // wifi_list_title ("Select a WiFi network") used to be left showing here
+  // too - it and wifi_pw_title ("Password for: ...") both sit at the same
+  // TOP_MID/y=8 spot, so the two labels rendered stacked on top of each
+  // other in this view. Hiding it is the fix.
+  lv_obj_add_flag(wifi_list_title, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(wifi_current_box, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(wifi_up_btn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(wifi_select_btn, LV_OBJ_FLAG_HIDDEN);
@@ -1438,12 +1634,32 @@ void showWifiPasswordView(const String &ssid) {
   lv_obj_clear_flag(wifi_pw_title, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(wifi_pw_ta, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(wifi_pw_status_label, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(wifi_pw_symbols_btn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(wifi_pw_back_btn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(wifi_pw_kb, LV_OBJ_FLAG_HIDDEN);
 }
 
 void wifiBackToListBtnEventCb(lv_event_t *e) {
   showWifiListView();
+}
+
+// Cycles WIFI_SYMBOLS_CYCLE on repeated taps, same multi-tap-within-timeout
+// pattern as the T9 letter keys, just standalone (this button isn't part of
+// the btnmatrix/T9_CYCLES - see wifi_pw_symbols_btn's declaration).
+void wifiPwSymbolsBtnEventCb(lv_event_t *e) {
+  int cycleLen = (int)strlen(WIFI_SYMBOLS_CYCLE);
+  uint32_t now = millis();
+  bool cycling = (now - g_wifiSymLastPressMs < T9_CYCLE_TIMEOUT_MS) && g_wifiSymLastPressMs != 0;
+
+  if (cycling) {
+    lv_textarea_del_char(wifi_pw_ta);
+    g_wifiSymCyclePos = (g_wifiSymCyclePos + 1) % cycleLen;
+  } else {
+    g_wifiSymCyclePos = 0;
+  }
+
+  lv_textarea_add_char(wifi_pw_ta, WIFI_SYMBOLS_CYCLE[g_wifiSymCyclePos]);
+  g_wifiSymLastPressMs = now;
 }
 
 void wifiPwKeypadEventCb(lv_event_t *e) {
@@ -1463,12 +1679,19 @@ void wifiPwKeypadEventCb(lv_event_t *e) {
     lv_label_set_text(wifi_pw_status_label, "Connecting...");
     lv_refr_now(NULL);
     if (tryConnectWifi(g_wifiSetupSsid, pass, wifi_pw_status_label)) {
-      saveWifi(g_wifiSetupSsid, pass);
+      persistWifiCredential(g_wifiSetupSsid, pass);
       g_wifiSetupConnected = true;
       g_wifiSetupDone = true;
     } else {
       lv_label_set_text(wifi_pw_status_label, "Failed - check password, try again");
     }
+    return;
+  }
+  if (idx == T9_SHIFT_IDX) {
+    g_wifiT9ShiftOn = !g_wifiT9ShiftOn;
+    lv_btnmatrix_set_map(btnm, g_wifiT9ShiftOn ? chat_t9_map_upper : chat_t9_map_lower);
+    lv_btnmatrix_set_btn_ctrl(btnm, idx, LV_BTNMATRIX_CTRL_CHECKED);
+    if (!g_wifiT9ShiftOn) lv_btnmatrix_clear_btn_ctrl(btnm, idx, LV_BTNMATRIX_CTRL_CHECKED);
     return;
   }
 
@@ -1486,7 +1709,9 @@ void wifiPwKeypadEventCb(lv_event_t *e) {
     g_wifiT9CyclePos = 0;
   }
 
-  lv_textarea_add_char(wifi_pw_ta, cycle[g_wifiT9CyclePos]);
+  char ch = cycle[g_wifiT9CyclePos];
+  if (g_wifiT9ShiftOn && ch >= 'a' && ch <= 'z') ch = ch - 'a' + 'A';
+  lv_textarea_add_char(wifi_pw_ta, ch);
   g_wifiT9LastBtnIdx = idx;
   g_wifiT9LastPressMs = now;
 }
@@ -1501,10 +1726,7 @@ void wifiListSkipBtnEventCb(lv_event_t *e) {
 // nothing working yet) - "cancel" should restore whatever was previously
 // connected rather than force offline mode.
 void wifiListCancelBtnEventCb(lv_event_t *e) {
-  String ssid, pass;
-  if (loadSavedWifi(ssid, pass)) {
-    tryConnectWifi(ssid, pass, nullptr);
-  }
+  connectToAnySavedWifi(nullptr);
   g_wifiSetupConnected = (WiFi.status() == WL_CONNECTED);
   g_wifiSetupDone = true;
 }
@@ -1527,7 +1749,7 @@ void wifiSelectBtnEventCb(lv_event_t *e) {
   bool isOpen = (WiFi.encryptionType(g_wifiListIdx) == WIFI_AUTH_OPEN);
   if (isOpen) {
     if (tryConnectWifi(ssid, "", nullptr)) {
-      saveWifi(ssid, "");
+      persistWifiCredential(ssid, "");
       g_wifiSetupConnected = true;
       g_wifiSetupDone = true;
       return;
@@ -1542,10 +1764,10 @@ void createWifiSetupScreen() {
   lv_obj_clean(lv_scr_act());
   lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x0f172a), 0);
 
-  lv_obj_t *title = lv_label_create(lv_scr_act());
-  lv_label_set_text(title, "Select a WiFi network");
-  lv_obj_set_style_text_color(title, lv_color_hex(0x22c55e), 0);
-  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+  wifi_list_title = lv_label_create(lv_scr_act());
+  lv_label_set_text(wifi_list_title, "Select a WiFi network");
+  lv_obj_set_style_text_color(wifi_list_title, lv_color_hex(0x22c55e), 0);
+  lv_obj_align(wifi_list_title, LV_ALIGN_TOP_MID, 0, 8);
   lv_refr_now(NULL); // paint the title before the blocking scan below
 
   // Two columns, all standalone lv_btn/lv_obj widgets directly on the
@@ -1571,6 +1793,19 @@ void createWifiSetupScreen() {
   Serial.println("Scanning WiFi networks...");
   int n = WiFi.scanNetworks();
   Serial.printf("scanNetworks() returned %d\r\n", n);
+  // ESP32 quirk: the very first scanNetworks() right after a mode/radio
+  // change frequently comes back 0 or WIFI_SCAN_FAILED (-2) because the
+  // radio hasn't settled yet - a second attempt a moment later almost
+  // always succeeds. Without this retry, a bad first scan left the list
+  // empty and Up/Down/Select silently no-op'd (they early-return whenever
+  // g_wifiListCount <= 0 - see wifiUpBtnEventCb() etc.), which looked like
+  // "the buttons don't work" with no way to recover short of Cancel/Skip.
+  for (int attempt = 0; n <= 0 && attempt < 2; attempt++) {
+    Serial.println("Scan came back empty/failed - retrying...");
+    delay(300);
+    n = WiFi.scanNetworks();
+    Serial.printf("scanNetworks() retry returned %d\r\n", n);
+  }
   g_wifiListCount = n > 0 ? n : 0;
   g_wifiListIdx = 0;
 
@@ -1714,9 +1949,27 @@ void createWifiSetupScreen() {
   lv_obj_set_style_text_color(wifi_pw_status_label, lv_color_hex(0xffffff), 0);
   lv_obj_align(wifi_pw_status_label, LV_ALIGN_TOP_MID, 0, 80);
 
+  // This used to be one 70x202 Back button running the full height of the
+  // keypad - way taller than it needed to be for one action. Split into two
+  // 70x99 buttons stacked with a 4px gap (99+4+99=202, same footprint):
+  // Symbols on top (password-oriented punctuation the T9 cycles don't
+  // cover), Back on the bottom.
+  wifi_pw_symbols_btn = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(wifi_pw_symbols_btn, 70, 99);
+  lv_obj_align(wifi_pw_symbols_btn, LV_ALIGN_TOP_RIGHT, -10, 113);
+  lv_obj_add_event_cb(wifi_pw_symbols_btn, wifiPwSymbolsBtnEventCb, LV_EVENT_CLICKED, NULL);
+  lv_obj_set_style_radius(wifi_pw_symbols_btn, 16, 0);
+  lv_obj_set_style_bg_color(wifi_pw_symbols_btn, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(wifi_pw_symbols_btn, 1, 0);
+  lv_obj_set_style_border_color(wifi_pw_symbols_btn, lv_color_hex(0x22c55e), 0); // same outline theme as T9 keys
+  lv_obj_t *symbols_label = lv_label_create(wifi_pw_symbols_btn);
+  lv_label_set_text(symbols_label, "@#$\n%^&*");
+  lv_obj_set_style_text_align(symbols_label, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_center(symbols_label);
+
   wifi_pw_back_btn = lv_btn_create(lv_scr_act());
-  lv_obj_set_size(wifi_pw_back_btn, 70, 202);
-  lv_obj_align(wifi_pw_back_btn, LV_ALIGN_TOP_RIGHT, -10, 113);
+  lv_obj_set_size(wifi_pw_back_btn, 70, 99);
+  lv_obj_align(wifi_pw_back_btn, LV_ALIGN_TOP_RIGHT, -10, 113 + 99 + 4);
   lv_obj_add_event_cb(wifi_pw_back_btn, wifiBackToListBtnEventCb, LV_EVENT_CLICKED, NULL);
   lv_obj_set_style_radius(wifi_pw_back_btn, 16, 0);
   lv_obj_set_style_bg_color(wifi_pw_back_btn, lv_color_hex(0x1e293b), 0);
@@ -1740,6 +1993,9 @@ void createWifiSetupScreen() {
   lv_obj_set_style_border_width(wifi_pw_kb, 1, LV_PART_ITEMS);
   lv_obj_set_style_border_color(wifi_pw_kb, lv_color_hex(0x22c55e), LV_PART_ITEMS);
   lv_obj_set_style_text_color(wifi_pw_kb, lv_color_hex(0xffffff), LV_PART_ITEMS);
+  // Shift key's "on" indicator - see the matching styling on chat_kb above.
+  lv_obj_set_style_bg_color(wifi_pw_kb, lv_color_hex(0x22c55e), LV_PART_ITEMS | LV_STATE_CHECKED);
+  lv_obj_set_style_text_color(wifi_pw_kb, lv_color_hex(0x0f172a), LV_PART_ITEMS | LV_STATE_CHECKED);
   lv_obj_set_size(wifi_pw_kb, 380, 202);
   lv_obj_align(wifi_pw_kb, LV_ALIGN_TOP_LEFT, 10, 113);
 
@@ -1970,23 +2226,26 @@ void setup()
   lv_refr_now(NULL);
   Serial.println("Initial display created");
 
-  // WiFi: try creds saved in NVS from a previous on-device setup first; if
-  // none are saved (first boot) or they no longer work, fall back to
-  // secrets.h once as a legacy convenience, then finally show the
-  // scan-and-tap setup screen (see runWifiSetupFlow()) rather than requiring
-  // a reflash to change networks.
-  bool wifiConnected = false;
-  String savedSsid, savedPass;
-  if (loadSavedWifi(savedSsid, savedPass)) {
-    lv_label_set_text(chat_response_label, "Connecting to saved WiFi...");
-    lv_refr_now(NULL);
-    wifiConnected = tryConnectWifi(savedSsid, savedPass, chat_response_label);
-  }
+  // TF/micro-SD card (multi-network WiFi storage - see the comment above
+  // loadSavedWifi()). Non-fatal if there's no card inserted or it fails to
+  // init: g_sdReady just stays false and everything below transparently
+  // falls back to the single NVS-saved network, same as before this existed.
+  g_sdReady = SD.begin(TF_CS);
+  Serial.println(g_sdReady ? "SD card ready" : "No SD card / init failed - using NVS-only WiFi storage");
+
+  // WiFi: try every saved network (SD list, then the single NVS entry -
+  // see connectToAnySavedWifi()) first; if none are saved (first boot) or
+  // none work, fall back to secrets.h once as a legacy convenience, then
+  // finally show the scan-and-tap setup screen (see runWifiSetupFlow())
+  // rather than requiring a reflash to change networks.
+  lv_label_set_text(chat_response_label, "Connecting to saved WiFi...");
+  lv_refr_now(NULL);
+  bool wifiConnected = connectToAnySavedWifi(chat_response_label);
   if (!wifiConnected && strlen(WIFI_SSID) > 0) {
     lv_label_set_text(chat_response_label, "Connecting to WiFi...");
     lv_refr_now(NULL);
     wifiConnected = tryConnectWifi(WIFI_SSID, WIFI_PASSWORD, chat_response_label);
-    if (wifiConnected) saveWifi(WIFI_SSID, WIFI_PASSWORD); // adopt it into NVS going forward
+    if (wifiConnected) persistWifiCredential(WIFI_SSID, WIFI_PASSWORD); // adopt it going forward
   }
   if (!wifiConnected) {
     Serial.println("No working saved WiFi - starting on-device setup...");

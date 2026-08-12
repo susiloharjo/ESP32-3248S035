@@ -202,6 +202,8 @@ Use versioned topics and derive authorization from authenticated device identity
 
 Do not place secrets, operator names, or reason text in topic paths.
 
+**Ad-hoc extension (2026-08-12, not originally specced here):** `eventType: "PRODUCTION_COUNT_UPDATED"` is also published on the Device event topic, for the operator-facing production-count screen (`firmware/src/main.cpp`'s `showScreenUpdateProduction()`/`onProductionConfirm()` - already flagged in that file as scope beyond design.md's numbered screens). Payload: `{ "productionCount": <int>, "workOrderId": "<string>" }`. Reuses the existing envelope/topic/idempotency convention rather than a new topic; acked via the same COMMAND_RESULT shape on the result topic (no `incidentId` - not an incident, no state-machine lifecycle applies). Implemented in `firmware/src/andon_mqtt.cpp` (`AndonMqtt::submitProductionUpdate()`) and `backend/src/server.ts`'s test backend. Revisit (proper contract doc under `contracts/`, real persistence) before this leaves test-backend scope.
+
 ### 8.2 Event envelope
 
 ```json

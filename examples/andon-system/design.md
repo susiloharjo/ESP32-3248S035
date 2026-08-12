@@ -129,7 +129,9 @@ Connectivity semantics:
 | Amber dot | Wi-Fi available; broker reconnecting or sync pending |
 | Red dot | Offline; local cache only |
 
-The header is informational and not normally interactive.
+**Current implementation (2026-08-12):** no MQTT broker exists yet (see `agents.md`'s repository ownership table - `backend/` hasn't been created), so the dot/Wi-Fi icon can only reflect what's actually measurable right now: raw `WiFi.status()` (green = connected, red = not) via `main.cpp`'s `updateHeaderConnDot()`, refreshed every second by the 1Hz tick timer. The amber ("Wi-Fi up, broker down") tier described above needs a real broker connection to distinguish from green and isn't implemented - revisit once MQTT exists. Local time is now NTP-synced (`andon_wifi.cpp`'s `configTime()` call on connect, GMT+7 default) instead of a fixed placeholder; shows `--:--` until the first successful sync.
+
+The header is informational and not normally interactive (aside from the long-press dev gesture - see `agents.md`-deviation note in `firmware/src/main.cpp`'s `headerLongPressCb()` - which only toggles the separate LINE RUNNING/OFFLINE mock banner state, not these connectivity indicators).
 
 ## 7. Screen specifications
 
@@ -143,13 +145,14 @@ Content:
 - Work order: `WO-240811-07`.
 - Production: `72 / 120`.
 - Rate: `18 pcs/h`.
-- Primary action: `NEED ASSISTANCE`.
+- Bottom row: three equal-width icon-only buttons - update production (edit icon), primary action `NEED ASSISTANCE` (bell icon), config (gear icon).
 
 Rules:
 
 - `LINE RUNNING` is shown only when no blocking incident exists and the last known backend/device state permits it.
 - When offline, show an amber `OFFLINE — LOCAL MODE` banner instead of asserting a synchronized running state.
-- The primary action occupies the full lower width.
+- ~~The primary action occupies the full lower width.~~ **Superseded 2026-08-12** (explicit user instruction, `agents.md` §2 precedence rules): the lower row is a 3-way equal split between update-production, `NEED ASSISTANCE`, and config, all icon-only for equal visual weight. `NEED ASSISTANCE` stays the only color-coded (amber) button of the three so it still reads as the primary action; the other two use neutral/muted colors so they don't compete with it (`agents.md` §9 UI rule: "keep one dominant decision per screen").
+- Config (gear) opens WiFi setup (scan/select/type-password on a T9 keypad, NVS-saved network), ported from `examples/gemini-chatbot`'s on-device WiFi manager as-is (same keypad, same visual style - explicit user instruction) - see `firmware/include/andon_wifi.hpp`/`andon_wifi.cpp`. **Freely reachable from the operator flow** (explicit user instruction) - a second, larger deviation from this screen's original "hidden admin gesture/physical provisioning, not the operator flow" plan (see the changelog note above this table). `secrets.h`'s `WIFI_SSID`/`WIFI_PASSWORD` remain a fallback seed, not the only path, now that the on-screen flow exists.
 
 ### SCR-02 — Category selection
 
