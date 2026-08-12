@@ -1,0 +1,20 @@
+{
+  "name": "andon-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal test backend for the Digital Andon firmware - see src/server.ts's header comment for scope.",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "aedes": "^0.51.3",
+    "fastify": "^4.28.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.4"
+  }
+}

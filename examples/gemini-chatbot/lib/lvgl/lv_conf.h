@@ -672,16 +672,21 @@
  ====================*/
 
 /*Show some widget. It might be required to increase `LV_MEM_SIZE` */
-#define LV_USE_DEMO_WIDGETS        1
+// Disabled - none of these demos are actually called anywhere in main.cpp
+// (it only #included <demos/lv_demos.h> without ever calling
+// lv_demo_widgets()/lv_demo_benchmark()/etc), but leaving them enabled here
+// compiled the entire demo modules - including image assets like the
+// benchmark cogwheel bitmaps - into the firmware for nothing.
+#define LV_USE_DEMO_WIDGETS        0
 #if LV_USE_DEMO_WIDGETS
 #define LV_DEMO_WIDGETS_SLIDESHOW  1
 #endif
 
 /*Demonstrate the usage of encoder and keyboard*/
-#define LV_USE_DEMO_KEYPAD_AND_ENCODER     1
+#define LV_USE_DEMO_KEYPAD_AND_ENCODER     0
 
 /*Benchmark your system*/
-#define LV_USE_DEMO_BENCHMARK   1
+#define LV_USE_DEMO_BENCHMARK   0
 
 /*Stress test for LVGL*/
 #define LV_USE_DEMO_STRESS      0

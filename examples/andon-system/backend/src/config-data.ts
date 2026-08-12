@@ -1,0 +1,54 @@
+// Seed data for GET /api/v1/configuration/stations/:stationId - same
+// shape/content as ../../contracts/http/v1/get-configuration-stations.example.json
+// (kept as a separate literal here rather than importing that file, so this
+// package has no reach-outside-itself build dependency; keep the two in
+// sync by hand if the taxonomy changes).
+export const STATION_CONFIG = {
+  configVersion: 1,
+  categories: [
+    {
+      code: "MAINTENANCE",
+      reasons: [
+        { code: "MACHINE_JAM", label: "Machine jam" },
+        { code: "CUTTING_FAULT", label: "Cutting fault" },
+        { code: "WELDING_FAULT", label: "Welding fault" },
+        { code: "SENSOR_FAULT", label: "Sensor fault" },
+        { code: "UTILITY", label: "Utility" },
+        { code: "OTHER", label: "Other" },
+      ],
+    },
+    {
+      code: "QUALITY",
+      reasons: [
+        { code: "DIMENSION_OUT_OF_SPEC", label: "Dimension out of spec" },
+        { code: "SURFACE_DEFECT", label: "Surface defect" },
+        { code: "CONTAMINATION", label: "Contamination" },
+        { code: "REWORK_REQUIRED", label: "Rework required" },
+        { code: "INSPECTION_HOLD", label: "Inspection hold" },
+        { code: "OTHER", label: "Other" },
+      ],
+    },
+    {
+      code: "MATERIAL",
+      reasons: [
+        { code: "MATERIAL_SHORTAGE", label: "Material shortage" },
+        { code: "WRONG_MATERIAL", label: "Wrong material" },
+        { code: "DELAYED_DELIVERY", label: "Delayed delivery" },
+        { code: "PACKAGING_ISSUE", label: "Packaging issue" },
+        { code: "RACK_FULL", label: "Rack full" },
+        { code: "OTHER", label: "Other" },
+      ],
+    },
+    {
+      code: "SUPERVISOR",
+      reasons: [
+        { code: "LINE_COORDINATION", label: "Line coordination" },
+        { code: "SAFETY_CONCERN", label: "Safety concern" },
+        { code: "SCHEDULE_CHANGE", label: "Schedule change" },
+        { code: "QUALITY_ESCALATION", label: "Quality escalation" },
+        { code: "STAFFING_ISSUE", label: "Staffing issue" },
+        { code: "OTHER", label: "Other" },
+      ],
+    },
+  ],
+} as const;

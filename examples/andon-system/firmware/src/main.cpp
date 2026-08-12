@@ -10,6 +10,12 @@
 #include <Arduino.h>
 #include <lvgl.h>
 #include <TFT_eSPI.h>
+#include <WiFi.h> // WiFi.status() - real header connectivity indicator, see updateHeaderConnDot()
+#include <time.h> // struct tm/getLocalTime/strftime - NTP header clock, see tickTimerCb()
+
+#include "andon_config.hpp" // reason-list sync from the backend - see setup(), andon_config.cpp
+#include "andon_wifi.hpp" // on-device WiFi setup screen - see onOpenConfig(), loop()
+#include "andon_mqtt.hpp" // Send Request submission - see submitRequest()
 
 //------------------------------------------------------------------------------
 // GT911 touch controller - bit-banged I2C driver
@@ -555,22 +561,43 @@ static const char *REASONS_SUPERVISOR[] = {
   "Line coordination", "Safety concern", "Schedule change", "Quality escalation", "Staffing issue", "Other"
 };
 
-struct CategoryInfo {
-  const char *label;
-  const char *icon; // closest LV_SYMBOL_* match - LVGL's built-in symbol set has
-                     // no wrench/magnifier/box/person glyphs, see PLAN.md note
-  uint32_t color;
-  const char **reasons;
-  uint8_t reasonCount;
+// Machine codes for the reasons above, same order/index - what
+// AndonMqtt::submitAndonRequest() actually sends as reasonCode
+// (architectur.md SS8.2); the arrays above are just what SCR-03 displays.
+// Matches contracts/http/v1/get-configuration-stations.example.json's
+// codes exactly, so a live AndonConfig::sync() fetch (which DOES carry
+// real codes from the backend - see andon_config.cpp) and this hardcoded
+// placeholder agree on the same taxonomy.
+static const char *REASON_CODES_MAINTENANCE[] = {
+  "MACHINE_JAM", "CUTTING_FAULT", "WELDING_FAULT", "SENSOR_FAULT", "UTILITY", "OTHER"
+};
+static const char *REASON_CODES_QUALITY[] = {
+  "DIMENSION_OUT_OF_SPEC", "SURFACE_DEFECT", "CONTAMINATION", "REWORK_REQUIRED", "INSPECTION_HOLD", "OTHER"
+};
+static const char *REASON_CODES_MATERIAL[] = {
+  "MATERIAL_SHORTAGE", "WRONG_MATERIAL", "DELAYED_DELIVERY", "PACKAGING_ISSUE", "RACK_FULL", "OTHER"
+};
+static const char *REASON_CODES_SUPERVISOR[] = {
+  "LINE_COORDINATION", "SAFETY_CONCERN", "SCHEDULE_CHANGE", "QUALITY_ESCALATION", "STAFFING_ISSUE", "OTHER"
 };
 
+// CategoryInfo itself lives in andon_types.hpp now (shared with
+// andon_config.cpp - see andon_config.hpp), not defined here anymore.
+#include "andon_types.hpp"
+
 // Order matches the reference mockup's 2x2 grid: top-left/top-right/
-// bottom-left/bottom-right.
-static const CategoryInfo CATEGORIES[4] = {
-  {"MAINTENANCE", LV_SYMBOL_SETTINGS, COLOR_FAULT,    REASONS_MAINTENANCE, 6},
-  {"QUALITY",      LV_SYMBOL_EYE_OPEN, COLOR_QUALITY,  REASONS_QUALITY,      6},
-  {"MATERIAL",     LV_SYMBOL_DRIVE,    COLOR_MATERIAL, REASONS_MATERIAL,     6},
-  {"SUPERVISOR",   LV_SYMBOL_CALL,     COLOR_WAITING,  REASONS_SUPERVISOR,   6},
+// bottom-left/bottom-right. Deliberately NOT `static const` (unlike every
+// other data table in this file): AndonConfig::sync() (see
+// andon_config.cpp) rewrites a matched category's .reasons/.reasonCodes/
+// .reasonCount in place after fetching PRD.md AND-003's plant-configurable
+// reason list - PRD.md AND-002 fixes everything else about these four
+// categories (count, label/code, icon, color), so only those three fields
+// ever change at runtime.
+CategoryInfo CATEGORIES[4] = {
+  {"MAINTENANCE", LV_SYMBOL_SETTINGS, COLOR_FAULT,    REASONS_MAINTENANCE, REASON_CODES_MAINTENANCE, 6},
+  {"QUALITY",      LV_SYMBOL_EYE_OPEN, COLOR_QUALITY,  REASONS_QUALITY,     REASON_CODES_QUALITY,     6},
+  {"MATERIAL",     LV_SYMBOL_DRIVE,    COLOR_MATERIAL, REASONS_MATERIAL,    REASON_CODES_MATERIAL,    6},
+  {"SUPERVISOR",   LV_SYMBOL_CALL,     COLOR_WAITING,  REASONS_SUPERVISOR,  REASON_CODES_SUPERVISOR,  6},
 };
 
 //------------------------------------------------------------------------------
@@ -601,6 +628,7 @@ struct AndonState {
   uint32_t downtimeSec = 0;  // frozen at resolve time for SCR-06's summary
   bool mockConnected = true; // dev-toggleable fake connectivity (long-press header)
   int productionCount = 72;  // TODO(backend): synced from the line, not operator-owned truth
+  String incidentId = "";    // backend-assigned - set once AndonMqtt::submitAndonRequest() actually returns ACCEPTED (see submitRequest()); empty while queued/offline
 };
 static AndonState g_andon;
 
@@ -609,6 +637,7 @@ static AndonState g_andon;
 //------------------------------------------------------------------------------
 static lv_obj_t *g_header = nullptr;
 static lv_obj_t *g_headerTimeLabel = nullptr;
+static lv_obj_t *g_headerWifiIcon = nullptr;
 static lv_obj_t *g_headerConnDot = nullptr;
 static lv_obj_t *g_content = nullptr; // rebuilt per screen; header stays put
 
@@ -802,19 +831,31 @@ static void formatMMSS(uint32_t ms, char *out, size_t outLen) {
 // Global header (design.md SS6) - built once, never destroyed; only its
 // labels/dot get updated as screens change.
 //------------------------------------------------------------------------------
+// Real WiFi status now that AndonWifi exists (see andon_wifi.cpp) - was
+// previously tied to g_andon.mockConnected, same as the LINE RUNNING/
+// OFFLINE banner. Those are different concepts (this is raw radio-level
+// connectivity; mockConnected is "backend/incident state permits LINE
+// RUNNING", still mocked since there's no MQTT backend yet - see
+// showScreenNormal()) - deliberately decoupled: WiFi being up doesn't mean
+// no incident is blocking the line, and vice versa isn't true either.
 static void updateHeaderConnDot() {
-  if (!g_headerConnDot) return;
-  lv_obj_set_style_bg_color(g_headerConnDot,
-                             lv_color_hex(g_andon.mockConnected ? COLOR_RUNNING : COLOR_FAULT), 0);
+  bool wifiUp = (WiFi.status() == WL_CONNECTED);
+  if (g_headerConnDot) {
+    lv_obj_set_style_bg_color(g_headerConnDot, lv_color_hex(wifiUp ? COLOR_RUNNING : COLOR_FAULT), 0);
+  }
+  if (g_headerWifiIcon) {
+    lv_obj_set_style_text_color(g_headerWifiIcon, lv_color_hex(wifiUp ? COLOR_RUNNING : COLOR_FAULT), 0);
+  }
 }
 
 // DEV/DEMO ONLY: long-press the header to flip the mock connectivity flag,
 // so the QueuedOffline path (SCR-04B) can be demoed without real WiFi loss.
 // Not part of the product UI - design.md SS11 allows "a hidden admin gesture"
-// as long as it stays out of the operator flow; this is that gesture.
+// as long as it stays out of the operator flow; this is that gesture. No
+// longer touches the header dot/WiFi icon (see updateHeaderConnDot()'s
+// comment) - only the LINE RUNNING/OFFLINE banner responds to this now.
 static void headerLongPressCb(lv_event_t *e) {
   g_andon.mockConnected = !g_andon.mockConnected;
-  updateHeaderConnDot();
   Serial.printf("[demo] mockConnected toggled -> %d\r\n", g_andon.mockConnected);
 }
 
@@ -846,10 +887,10 @@ static void buildHeader() {
   // space (dot/MQTT ended up ~2px apart, clock got squeezed/clipped). Fixed
   // left edges with generous gaps make the layout independent of exact text
   // width as long as it's under each slot's reserved room.
-  lv_obj_t *wifi = lv_label_create(g_header);
-  lv_label_set_text(wifi, LV_SYMBOL_WIFI);
-  lv_obj_set_style_text_color(wifi, lv_color_hex(COLOR_INFO), 0);
-  lv_obj_align(wifi, LV_ALIGN_LEFT_MID, 300, 0);
+  g_headerWifiIcon = lv_label_create(g_header);
+  lv_label_set_text(g_headerWifiIcon, LV_SYMBOL_WIFI);
+  lv_obj_set_style_text_color(g_headerWifiIcon, lv_color_hex(COLOR_INFO), 0);
+  lv_obj_align(g_headerWifiIcon, LV_ALIGN_LEFT_MID, 300, 0);
 
   g_headerConnDot = lv_obj_create(g_header);
   lv_obj_set_size(g_headerConnDot, 10, 10);
@@ -867,7 +908,7 @@ static void buildHeader() {
   lv_obj_align(mqttLabel, LV_ALIGN_LEFT_MID, 346, 0);
 
   g_headerTimeLabel = lv_label_create(g_header);
-  lv_label_set_text(g_headerTimeLabel, "08:00"); // dummy - no RTC/NTP in this UI-only build
+  lv_label_set_text(g_headerTimeLabel, "--:--"); // until NTP syncs - see tickTimerCb()
   lv_obj_set_style_text_color(g_headerTimeLabel, lv_color_hex(COLOR_TEXT_PRIMARY), 0);
   lv_obj_set_style_text_font(g_headerTimeLabel, &lv_font_montserrat_14, 0);
   lv_obj_align(g_headerTimeLabel, LV_ALIGN_LEFT_MID, 420, 0);
@@ -892,9 +933,9 @@ static void clearContent() {
   lv_obj_clean(g_content);
 }
 
-// 1Hz - elapsed/wait counter for whichever screen is showing one. The
-// header clock is a static dummy ("08:00") instead of live uptime - no
-// RTC/NTP in this UI-only build, so there's no real time to show anyway.
+// 1Hz - elapsed/wait counter for whichever screen is showing one, the
+// header WiFi/connectivity indicators, and the NTP-synced header clock
+// (see andon_wifi.cpp's configTime() call).
 static void tickTimerCb(lv_timer_t *timer) {
   if (g_elapsedLabel) {
     char buf[8];
@@ -905,6 +946,21 @@ static void tickTimerCb(lv_timer_t *timer) {
     char buf[8];
     formatMMSS(millis() - g_andon.requestOpenedMs, buf, sizeof(buf));
     lv_label_set_text(g_waitLabel, buf);
+  }
+
+  // Real WiFi status (was only refreshed right after explicit connect
+  // attempts - this catches drops/reconnects that happen in between too).
+  updateHeaderConnDot();
+
+  // NTP-synced clock (see andon_wifi.cpp's configTime() call). A tiny
+  // timeout (not the 5s default) so a not-yet-synced/no-WiFi state can
+  // never stall this 1Hz timer callback - on failure the label just keeps
+  // showing whatever it last had (starts as "--:--" from buildHeader()).
+  struct tm timeinfo;
+  if (g_headerTimeLabel && getLocalTime(&timeinfo, 5)) {
+    char buf[6];
+    strftime(buf, sizeof(buf), "%H:%M", &timeinfo);
+    lv_label_set_text(g_headerTimeLabel, buf);
   }
 }
 
@@ -988,6 +1044,20 @@ static void onOpenUpdateProduction(lv_event_t *e) {
   showScreenUpdateProduction();
 }
 
+// Gear button on SCR-01 -> WiFi setup, ported from examples/gemini-chatbot
+// (see andon_wifi.hpp/.cpp). Only SETS a flag here rather than calling
+// AndonWifi::runSetupFlow() directly: this handler runs SYNCHRONOUSLY
+// INSIDE the lv_timer_handler() call in loop() (LVGL dispatches the click
+// as part of indev processing), and runSetupFlow() has its own internal
+// lv_timer_handler() polling loop - calling it from here would be a
+// reentrant call into LVGL, which corrupted indev press/release tracking
+// every time gemini-chatbot's history tried that exact shortcut (see that
+// file's comments). loop() consumes the flag at the top level instead -
+// see below.
+static void onOpenConfig(lv_event_t *e) {
+  AndonWifi::requestSetup();
+}
+
 static void refreshProductionCounterLabel() {
   if (!g_productionCounterLabel) return;
   char buf[8];
@@ -1007,10 +1077,17 @@ static void onProductionPlus(lv_event_t *e) {
 
 static void onProductionCancel(lv_event_t *e) { showScreenNormal(); } // discards g_productionEditValue
 
-// TODO(backend): replace with MQTT publish/HTTP call to report the updated
-// production count once there's somewhere to send it.
+// eventType PRODUCTION_COUNT_UPDATED - see AndonMqtt::submitProductionUpdate()'s
+// comment for why this is an ad-hoc extension, not something architectur.md
+// SS8 specifies. Commits the local count either way (this screen's own
+// scratch-value/CANCEL semantics aren't backend-dependent) - only the
+// backend round trip's success/failure is logged, not surfaced to the
+// operator yet (known gap, matches submitRequest()'s "no visual feedback
+// during the blocking wait" note).
 static void onProductionConfirm(lv_event_t *e) {
   g_andon.productionCount = g_productionEditValue;
+  bool acked = AndonMqtt::submitProductionUpdate(g_andon.productionCount, "WO-240811-07");
+  Serial.printf("[production] count=%d backend_acked=%d\r\n", g_andon.productionCount, acked);
   showScreenNormal();
 }
 static void onCategoryCancel(lv_event_t *e) { showScreenNormal(); }
@@ -1035,9 +1112,23 @@ static void onReasonTap(lv_event_t *e) {
 static void submitRequest() {
   g_andon.requestOpenedMs = millis();
   g_andon.handling = false;
-  if (g_andon.mockConnected) {
+
+  // Real MQTT round trip now (see andon_mqtt.cpp) - replaces the old
+  // mockConnected-only decision. Blocks up to ~5s (AndonMqtt's bounded
+  // wait for the backend's COMMAND_RESULT) with no visual feedback yet
+  // during that wait (confirm dialog is already closed by this point) -
+  // known gap, not implemented in this pass.
+  const CategoryInfo &cat = CATEGORIES[g_andon.categoryIdx];
+  const char *reasonCode = cat.reasonCodes[g_andon.reasonIdx];
+  String incidentId;
+  bool accepted = AndonMqtt::submitAndonRequest(cat.label, reasonCode, "WO-240811-07", incidentId);
+
+  if (accepted) {
+    g_andon.incidentId = incidentId;
+    g_andon.mockConnected = true; // real accept implies real connectivity - keep the header/banner honest
     showScreenActive();
   } else {
+    g_andon.incidentId = "";
     showScreenQueuedOffline();
   }
 }
@@ -1156,19 +1247,30 @@ static void showScreenNormal() {
                    LV_SYMBOL_DRIVE, "PRODUCTION", productionText,
                    LV_SYMBOL_CHARGE, "RATE", "18 pcs/h");
 
-  // UPDATE PRODUCTION : NEED ASSISTANCE is a 2:1 width split (was
-  // NEED ASSISTANCE alone, full width).
-  int unit = (CONTENT_W - 2 * MARGIN - GAP) / 3;
-  int updateW = unit * 2;
-  int assistW = unit;
-  makeButton(g_content, MARGIN, 210, updateW, 62, COLOR_MATERIAL,
-             LV_SYMBOL_EDIT "  UPDATE PRODUCTION", &lv_font_montserrat_16, onOpenUpdateProduction, nullptr);
+  // Three equal icon-only squares: UPDATE PRODUCTION | NEED ASSISTANCE |
+  // config (gear). Deviates from design.md SCR-01 ("The primary action
+  // occupies the full lower width") - explicit user instruction, recorded
+  // here and in design.md's changelog per agents.md's precedence rules
+  // (explicit current instruction outranks an existing design spec, but
+  // the doc must still be updated to match, not left stale).
+  int gap2 = GAP * 2;
+  int unit = (CONTENT_W - 2 * MARGIN - gap2) / 3;
+  int iconY = 210, iconH = 62;
+
+  makeButton(g_content, MARGIN, iconY, unit, iconH, COLOR_MATERIAL,
+             LV_SYMBOL_EDIT, &lv_font_montserrat_28, onOpenUpdateProduction, nullptr);
   // Amber, not red - red is reserved for "there's an active fault" states
   // elsewhere (MAINTENANCE CALLED banner, STATUS: OPEN, etc.); using it here
   // too would make this entry point look like a fault already exists before
   // the operator has even tapped it.
-  makeButton(g_content, MARGIN + updateW + GAP, 210, assistW, 62, COLOR_WAITING,
-             LV_SYMBOL_BELL "  NEED\nASSISTANCE", &lv_font_montserrat_14, onNeedAssistance, nullptr);
+  makeButton(g_content, MARGIN + unit + GAP, iconY, unit, iconH, COLOR_WAITING,
+             LV_SYMBOL_BELL, &lv_font_montserrat_28, onNeedAssistance, nullptr);
+  // Neutral/muted, not a domain color - this is a secondary/system action
+  // (WiFi config - see onOpenConfig()), not a primary operator decision;
+  // agents.md UI rules: "keep one dominant decision per screen" (NEED
+  // ASSISTANCE), this shouldn't visually compete with it.
+  makeButton(g_content, MARGIN + 2 * (unit + GAP), iconY, unit, iconH, COLOR_DISABLED,
+             LV_SYMBOL_SETTINGS, &lv_font_montserrat_28, onOpenConfig, nullptr);
 }
 
 // Update production count - reached from SCR-01's UPDATE PRODUCTION button.
@@ -1513,6 +1615,14 @@ void setup() {
   showScreenNormal();
   lv_refr_now(NULL);
 
+  // Runs after the UI is already showing, so the terminal is usable
+  // immediately regardless of network state - see andon_config.hpp for the
+  // full fallback chain (cache, then live fetch, placeholders otherwise).
+  // Blocking (bounded ~10s WiFi timeout worst case): acceptable once at
+  // boot, but this must never be called again from inside the UI/timer
+  // loop without moving it off the LVGL task first.
+  AndonConfig::sync();
+
   lv_timer_create(tickTimerCb, 1000, nullptr);
 
   Serial.println("Setup done.");
@@ -1520,5 +1630,27 @@ void setup() {
 
 void loop() {
   lv_timer_handler();
+
+  // See onOpenConfig()'s comment: AndonWifi::runSetupFlow() must only ever
+  // be called from here (top-level, outside any LVGL event callback) - it
+  // runs its own internal lv_timer_handler() loop, which would be a
+  // reentrant call if invoked from inside the one above.
+  if (AndonWifi::isSetupRequested()) {
+    AndonWifi::clearSetupRequest();
+    bool connected = AndonWifi::runSetupFlow();
+    // runSetupFlow() wiped the entire screen (header included) for the
+    // scan/select/password flow - rebuild everything and go back to SCR-01.
+    buildHeader();
+    buildContent();
+    showScreenNormal();
+    lv_refr_now(NULL);
+    // WiFi state may have just changed (new network saved, or reconnected
+    // to a previously-working one) - worth an immediate reason-list
+    // refresh instead of waiting for the next reboot. Non-fatal either way
+    // (see AndonConfig::sync()'s fallback chain) whether this connects or not.
+    Serial.printf("AndonWifi: setup flow finished (connected=%d) - re-syncing config\r\n", connected);
+    AndonConfig::sync();
+  }
+
   delay(10);
 }
