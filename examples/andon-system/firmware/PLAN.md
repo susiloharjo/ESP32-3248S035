@@ -2,6 +2,8 @@
 
 **Status:** All 6 screens + SCR-04B + both confirmation dialogs implemented in `src/main.cpp` and flashed to the board (build order §7 steps 1–6 done in one pass rather than incrementally, for speed — step 7's on-device validation pass against design.md §14 is still pending real tap-testing).
 
+**2026-08-13 update — this plan's original "UI-only, no MQTT/backend" scope (§1, §8, §9 below) is no longer what's shipping.** A real `backend/` + MQTT test broker landed (see CLAUDE.md's andon-system section for the up-to-date architecture description) and this firmware now talks to it for some flows. Sections 1–9 are kept as the historical record of the original UI-only build; **§10 below is the current source of truth for what's actually wired vs. still stubbed.** Don't restart from §1's "no real MQTT/backend calls" framing.
+
 | Field | Value |
 |---|---|
 | Scope | `examples/andon-system/firmware/` only — the ESP32/CYD touchscreen UI |
@@ -102,3 +104,31 @@ If/when this firmware is wired to a real backend, re-read `agents.md` in full be
 - Real MQTT (`andon/v1/...` topics), REST API calls, PostgreSQL
 - NVS-persisted incident state across reboot (design.md's "restart recovery" requirement — revisit once state has somewhere durable to reconcile against)
 - Multi-language support (design.md §13) — English labels only for the first pass
+
+**Superseded by §10 below** — `backend/`, `contracts/`, `deploy/` now exist and real MQTT/REST calls are wired for two flows. `dashboard/` and NVS-persisted incident state are still genuinely not started. Multi-language is still not started either.
+
+## 10. Current implementation status (supersedes §1/§8/§9 above)
+
+Backend/MQTT integration landed via the `wifi-manager-improvements` merge (2026-08-13) plus follow-on work in this repo. This section is the thing to update going forward — see agents.md §16, "documentation must stay in sync with the code, every time."
+
+**Wired to the real backend:**
+- Config sync — `andon_config.cpp` fetches per-category reasons from `GET /api/v1/configuration/stations/{stationId}` at boot, NVS-cached, placeholder fallback if unreachable
+- On-device WiFi setup — `andon_wifi.cpp`, ported from gemini-chatbot (T9 scan/select/password, NVS-saved network)
+- On-device Server IP config — `andon_wifi.cpp`'s password-screen "Server" tab (same T9 keypad, switches target textarea), NVS-saved, falls back to `secrets.h`
+- **Send Request** (SCR-03 → SCR-04) — `AndonMqtt::submitAndonRequest()`, blocks for the backend's `COMMAND_RESULT`, only reports success on an actual `ACCEPTED`
+- **Production count update** — `AndonMqtt::submitProductionUpdate()`, same accept/reject mechanics (ad-hoc extension, not in architectur.md §8 - see that file's own note)
+
+**Still local mock state only** (no MQTT call at all — `TODO(backend)` comments mark these in `main.cpp`):
+- `CANCEL REQUEST` (SCR-04)
+- `ADD NOTE` (SCR-04) — literal no-op, not even a preset-note list yet
+- `UPDATE STATUS` / the Ack→Handling progression (SCR-05) — architecturally this should arrive *from* the backend (a technician's own device acknowledging), which needs MQTT **subscribe**; only publish exists so far, so `(DEMO) SIMULATE TECHNICIAN ACK` is still standing in for that
+- `CONFIRM & RUN` (SCR-06 resolve/close)
+- SCR-04B QueuedOffline isn't actually reached by a real MQTT failure yet (`submitAndonRequest()` just reports failure on timeout)
+
+**Reliability gaps already flagged in `andon_mqtt.hpp`'s own scope note** (deliberate, for this MVP test slice — not oversights): no persisted offline queue, no retry-with-backoff, no idempotency key surviving a reboot, no TLS/device credentials. All required for production per agents.md §9/§12.
+
+**Not done from this plan's original §7 build order:** step 7 (pass design.md §14's on-device validation checklist) has never been formally worked through.
+
+**Pending, not yet pulled into this repo:** a work-order list (SCR-01's WORK ORDER card is still the static `WO-240811-07` placeholder, non-clickable) and an "andon fetch from API" piece — both reportedly done at the office, not yet pushed as of 2026-08-13.
+
+**`examples/demo-hub/`** (the combined chat+andon mode-select firmware) was branched *before* all of the above landed — it has none of it (no backend/MQTT, no Server tab, old WiFi-only andon UI). Needs a manual re-sync if it should carry this work too; it isn't automatic.
