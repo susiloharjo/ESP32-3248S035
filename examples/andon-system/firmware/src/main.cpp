@@ -641,6 +641,17 @@ static lv_obj_t *g_headerWifiIcon = nullptr;
 static lv_obj_t *g_headerConnDot = nullptr;
 static lv_obj_t *g_content = nullptr; // rebuilt per screen; header stays put
 
+// Handle for tickTimerCb's 1Hz lv_timer_create() below (see setup()) - kept
+// so loop() can delete it before AndonWifi::runSetupFlow() wipes the whole
+// screen (header included). Without this, the timer kept firing during the
+// WiFi setup screen and wrote into g_headerConnDot/g_headerTimeLabel after
+// they'd already been deleted by that wipe - a dangling-pointer crash
+// (Guru Meditation Error, LoadProhibited) reproducible every time the WiFi
+// list populated after a scan. gemini-chatbot hit and fixed this exact bug
+// for its own header timer (g_chatHeaderTimer) - this wasn't carried over
+// when the WiFi manager got ported to andon-system.
+static lv_timer_t *g_tickTimer = nullptr;
+
 // Live widgets the 1Hz tick updates in place (design.md SS11: "update the
 // timer once per second; do not redraw the entire screen"). Null when the
 // current screen doesn't have one.
@@ -1623,7 +1634,7 @@ void setup() {
   // loop without moving it off the LVGL task first.
   AndonConfig::sync();
 
-  lv_timer_create(tickTimerCb, 1000, nullptr);
+  g_tickTimer = lv_timer_create(tickTimerCb, 1000, nullptr);
 
   Serial.println("Setup done.");
 }
@@ -1637,6 +1648,13 @@ void loop() {
   // reentrant call if invoked from inside the one above.
   if (AndonWifi::isSetupRequested()) {
     AndonWifi::clearSetupRequest();
+    // runSetupFlow() is about to wipe the entire screen, header included -
+    // stop the 1Hz tick first so it can't fire in between and write into
+    // header widgets that no longer exist (see g_tickTimer's comment).
+    if (g_tickTimer) {
+      lv_timer_del(g_tickTimer);
+      g_tickTimer = nullptr;
+    }
     bool connected = AndonWifi::runSetupFlow();
     // runSetupFlow() wiped the entire screen (header included) for the
     // scan/select/password flow - rebuild everything and go back to SCR-01.
@@ -1644,6 +1662,7 @@ void loop() {
     buildContent();
     showScreenNormal();
     lv_refr_now(NULL);
+    g_tickTimer = lv_timer_create(tickTimerCb, 1000, nullptr);
     // WiFi state may have just changed (new network saved, or reconnected
     // to a previously-working one) - worth an immediate reason-list
     // refresh instead of waiting for the next reboot. Non-fatal either way
