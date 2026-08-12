@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Arduino.h>
 #include <lvgl.h>
 
 // On-device WiFi manager, ported from examples/gemini-chatbot's
@@ -51,5 +52,15 @@ void clearSetupRequest();
 // the entire lv_scr_act(), not just the content container. Returns true
 // if WiFi ended up connected.
 bool runSetupFlow();
+
+// Backend host (bare IP/hostname, no scheme or port), set via the "Server"
+// tab on runSetupFlow()'s password screen (same T9 keypad as the WiFi
+// password field - see andon_wifi.cpp's onTabToggle()) and NVS-persisted
+// separately from the WiFi credentials. Returns "" if never configured -
+// callers (AndonConfig::sync(), AndonMqtt) fall back to secrets.h's
+// CONFIG_API_BASE_URL/MQTT_BROKER_HOST in that case, composing the URL
+// themselves since this is deliberately just the host, not a full URL
+// (HTTP port 8080 / MQTT port 1883 stay fixed - see secrets.example.h).
+String getServerHost();
 
 } // namespace AndonWifi

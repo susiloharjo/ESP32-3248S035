@@ -106,7 +106,13 @@ static bool fetchFromNetwork(String &outRawJson) {
     }
   }
 
-  String url = String(CONFIG_API_BASE_URL) + "/api/v1/configuration/stations/" + STATION_ID;
+  // AndonWifi::getServerHost() is the on-device "Server" tab's saved value
+  // (bare host, no scheme/port - see andon_wifi.hpp) - falls back to
+  // secrets.h's full CONFIG_API_BASE_URL if nothing's been entered there
+  // yet. Port 8080 stays fixed either way (see secrets.example.h).
+  String host = AndonWifi::getServerHost();
+  String baseUrl = host.length() > 0 ? ("http://" + host + ":8080") : String(CONFIG_API_BASE_URL);
+  String url = baseUrl + "/api/v1/configuration/stations/" + STATION_ID;
   Serial.printf("AndonConfig: GET %s\r\n", url.c_str());
 
   HTTPClient http;

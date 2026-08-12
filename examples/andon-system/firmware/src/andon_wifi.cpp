@@ -81,6 +81,23 @@ static bool tryConnectWifi(const String &ssid, const String &pass, lv_obj_t *sta
   return ok;
 }
 
+// --- NVS storage (backend host, separate namespace from WiFi creds) --------
+
+static Preferences s_serverPrefs;
+
+String AndonWifi::getServerHost() {
+  s_serverPrefs.begin("server", true); // read-only
+  String host = s_serverPrefs.getString("host", "");
+  s_serverPrefs.end();
+  return host;
+}
+
+static void saveServerHost(const String &host) {
+  s_serverPrefs.begin("server", false);
+  s_serverPrefs.putString("host", host);
+  s_serverPrefs.end();
+}
+
 bool AndonWifi::connectSavedOrFallback(lv_obj_t *statusLabel) {
   String ssid, pass;
   if (loadSavedWifi(ssid, pass)) {
@@ -150,6 +167,16 @@ static lv_obj_t *s_pwBackBtn = nullptr;
 static lv_obj_t *s_pwKb = nullptr;
 static String s_setupSsid = "";
 
+// "Server" tab - same screen, same T9 keypad, different target textarea.
+// s_activeTa is whichever of s_pwTa/s_serverTa the keypad is currently
+// writing into; kept as its own pointer (updated by onTabToggle() and
+// showPasswordView()) so onPwKeypad()/onSymbolsBtn() don't need to branch
+// on s_onServerTab themselves.
+static bool s_onServerTab = false;
+static lv_obj_t *s_serverTa = nullptr;
+static lv_obj_t *s_tabBtn = nullptr;
+static lv_obj_t *s_activeTa = nullptr;
+
 static int s_t9LastBtnIdx = -1;
 static int s_t9CyclePos = 0;
 static uint32_t s_t9LastPressMs = 0;
@@ -207,10 +234,48 @@ static void showListView() {
   lv_obj_clear_flag(s_skipBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_pwTitle, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_pwTa, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(s_serverTa, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_pwStatusLabel, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_pwSymbolsBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_pwBackBtn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(s_tabBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_pwKb, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Shows whichever of s_pwTa/s_serverTa matches s_onServerTab, updates the
+// title and the tab button's own label to name the OTHER tab (what tapping
+// it switches to), and points s_activeTa at the now-visible field so
+// onPwKeypad()/onSymbolsBtn() don't need to know about tabs at all.
+static void applyTabVisibility() {
+  if (s_onServerTab) {
+    lv_label_set_text(s_pwTitle, "Backend server IP");
+    lv_obj_add_flag(s_pwTa, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_serverTa, LV_OBJ_FLAG_HIDDEN);
+    s_activeTa = s_serverTa;
+  } else {
+    lv_label_set_text_fmt(s_pwTitle, "Password for: %s", s_setupSsid.c_str());
+    lv_obj_clear_flag(s_pwTa, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_serverTa, LV_OBJ_FLAG_HIDDEN);
+    s_activeTa = s_pwTa;
+  }
+}
+
+static void onTabToggle(lv_event_t *e) {
+  s_onServerTab = !s_onServerTab;
+  // A multi-tap cycle in progress on one tab shouldn't bleed into the
+  // other's textarea via a stale s_t9LastBtnIdx/s_symLastPressMs.
+  s_t9LastBtnIdx = -1;
+  s_symLastPressMs = 0;
+  lv_label_set_text(s_pwStatusLabel, "");
+  if (s_onServerTab) {
+    lv_textarea_set_text(s_serverTa, AndonWifi::getServerHost().c_str());
+    lv_obj_t *tabLabel = lv_obj_get_child(s_tabBtn, 0);
+    lv_label_set_text(tabLabel, LV_SYMBOL_LEFT "\nWiFi");
+  } else {
+    lv_obj_t *tabLabel = lv_obj_get_child(s_tabBtn, 0);
+    lv_label_set_text(tabLabel, "Server\n" LV_SYMBOL_RIGHT);
+  }
+  applyTabVisibility();
 }
 
 static void showPasswordView(const String &ssid) {
@@ -219,11 +284,14 @@ static void showPasswordView(const String &ssid) {
   s_t9ShiftOn = false;
   s_symCyclePos = 0;
   s_symLastPressMs = 0;
+  s_onServerTab = false; // always reopen on the WiFi tab, not wherever it was left
   lv_btnmatrix_set_map(s_pwKb, wifiT9MapLower);
   lv_btnmatrix_clear_btn_ctrl(s_pwKb, T9_SHIFT_IDX, LV_BTNMATRIX_CTRL_CHECKED);
-  lv_label_set_text_fmt(s_pwTitle, "Password for: %s", ssid.c_str());
   lv_textarea_set_text(s_pwTa, "");
   lv_label_set_text(s_pwStatusLabel, "");
+  lv_obj_t *tabLabel = lv_obj_get_child(s_tabBtn, 0);
+  lv_label_set_text(tabLabel, "Server\n" LV_SYMBOL_RIGHT);
+  applyTabVisibility(); // sets s_pwTitle text too, so no separate title line needed here
 
   // s_listTitle and s_pwTitle both sit at the same TOP_MID/y=8 spot (see
   // gemini-chatbot's history - they stacked/overlapped before that file
@@ -237,10 +305,10 @@ static void showPasswordView(const String &ssid) {
   lv_obj_add_flag(s_cancelBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_skipBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_pwTitle, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_clear_flag(s_pwTa, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_pwStatusLabel, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_pwSymbolsBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_pwBackBtn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(s_tabBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_pwKb, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -251,12 +319,12 @@ static void onSymbolsBtn(lv_event_t *e) {
   uint32_t now = millis();
   bool cycling = (now - s_symLastPressMs < T9_CYCLE_TIMEOUT_MS) && s_symLastPressMs != 0;
   if (cycling) {
-    lv_textarea_del_char(s_pwTa);
+    lv_textarea_del_char(s_activeTa);
     s_symCyclePos = (s_symCyclePos + 1) % cycleLen;
   } else {
     s_symCyclePos = 0;
   }
-  lv_textarea_add_char(s_pwTa, WIFI_SYMBOLS_CYCLE[s_symCyclePos]);
+  lv_textarea_add_char(s_activeTa, WIFI_SYMBOLS_CYCLE[s_symCyclePos]);
   s_symLastPressMs = now;
 }
 
@@ -267,13 +335,24 @@ static void onPwKeypad(lv_event_t *e) {
   if (idx == LV_BTNMATRIX_BTN_NONE) return;
 
   if (idx == T9_BACKSPACE_IDX) {
-    lv_textarea_del_char(s_pwTa);
+    lv_textarea_del_char(s_activeTa);
     s_t9LastBtnIdx = -1;
     return;
   }
   if (idx == T9_SEND_IDX) {
     s_t9LastBtnIdx = -1;
-    String pass = lv_textarea_get_text(s_pwTa);
+    if (s_onServerTab) {
+      // Just persists the field and stays on this screen - unlike the WiFi
+      // tab's Send, there's no "did it work" to test synchronously (that
+      // only happens once AndonConfig::sync()/AndonMqtt actually reach the
+      // host), so this can't set s_setupDone the way a successful WiFi
+      // connect does.
+      String host = lv_textarea_get_text(s_activeTa);
+      saveServerHost(host);
+      lv_label_set_text(s_pwStatusLabel, "Saved!");
+      return;
+    }
+    String pass = lv_textarea_get_text(s_activeTa);
     lv_label_set_text(s_pwStatusLabel, "Connecting...");
     lv_refr_now(NULL);
     if (tryConnectWifi(s_setupSsid, pass, s_pwStatusLabel)) {
@@ -300,7 +379,7 @@ static void onPwKeypad(lv_event_t *e) {
   uint32_t now = millis();
   bool cyclingSameKey = (idx == s_t9LastBtnIdx) && (now - s_t9LastPressMs < T9_CYCLE_TIMEOUT_MS);
   if (cyclingSameKey) {
-    lv_textarea_del_char(s_pwTa);
+    lv_textarea_del_char(s_activeTa);
     s_t9CyclePos = (s_t9CyclePos + 1) % cycleLen;
   } else {
     s_t9CyclePos = 0;
@@ -308,7 +387,7 @@ static void onPwKeypad(lv_event_t *e) {
 
   char ch = cycle[s_t9CyclePos];
   if (s_t9ShiftOn && ch >= 'a' && ch <= 'z') ch = ch - 'a' + 'A';
-  lv_textarea_add_char(s_pwTa, ch);
+  lv_textarea_add_char(s_activeTa, ch);
   s_t9LastBtnIdx = idx;
   s_t9LastPressMs = now;
 }
@@ -509,14 +588,36 @@ static void createSetupScreen() {
   lv_obj_set_style_bg_color(s_pwTa, lv_color_hex(0x1e293b), 0);
   lv_obj_set_style_text_color(s_pwTa, lv_color_hex(0xffffff), 0);
 
+  // Same style/position as s_pwTa (only one of the two is ever visible -
+  // see applyTabVisibility()), for the Server tab.
+  s_serverTa = lv_textarea_create(lv_scr_act());
+  lv_obj_set_size(s_serverTa, 460, 40);
+  lv_obj_align(s_serverTa, LV_ALIGN_TOP_MID, 0, 35);
+  lv_textarea_set_one_line(s_serverTa, true);
+  lv_textarea_set_password_mode(s_serverTa, false);
+  lv_textarea_set_placeholder_text(s_serverTa, "Backend IP, e.g. 192.168.1.50");
+  lv_obj_set_style_radius(s_serverTa, 16, 0);
+  lv_obj_set_style_border_width(s_serverTa, 2, 0);
+  lv_obj_set_style_border_color(s_serverTa, lv_color_hex(0x22c55e), 0);
+  lv_obj_set_style_bg_color(s_serverTa, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_text_color(s_serverTa, lv_color_hex(0xffffff), 0);
+  lv_obj_add_flag(s_serverTa, LV_OBJ_FLAG_HIDDEN);
+
   s_pwStatusLabel = lv_label_create(lv_scr_act());
   lv_label_set_text(s_pwStatusLabel, "");
   lv_obj_set_style_text_color(s_pwStatusLabel, lv_color_hex(0xffffff), 0);
   lv_obj_align(s_pwStatusLabel, LV_ALIGN_TOP_MID, 0, 80);
 
+  // Right column is 3 stacked buttons now (was 2, ~99px each) to fit the
+  // WiFi/Server tab switch alongside Symbols/Back - 64px each still clears
+  // design.md's 48px touch-target minimum with room to spare.
+  const int32_t PW_BTN_W = 70, PW_BTN_H = 64, PW_BTN_GAP = 4;
+  const int32_t PW_COL_X = -10;
+  int32_t pwBtnY = 113;
+
   s_pwSymbolsBtn = lv_btn_create(lv_scr_act());
-  lv_obj_set_size(s_pwSymbolsBtn, 70, 99);
-  lv_obj_align(s_pwSymbolsBtn, LV_ALIGN_TOP_RIGHT, -10, 113);
+  lv_obj_set_size(s_pwSymbolsBtn, PW_BTN_W, PW_BTN_H);
+  lv_obj_align(s_pwSymbolsBtn, LV_ALIGN_TOP_RIGHT, PW_COL_X, pwBtnY);
   lv_obj_add_event_cb(s_pwSymbolsBtn, onSymbolsBtn, LV_EVENT_CLICKED, NULL);
   lv_obj_set_style_radius(s_pwSymbolsBtn, 16, 0);
   lv_obj_set_style_bg_color(s_pwSymbolsBtn, lv_color_hex(0x1e293b), 0);
@@ -526,10 +627,11 @@ static void createSetupScreen() {
   lv_label_set_text(symbolsLabel, "@#$\n%^&*");
   lv_obj_set_style_text_align(symbolsLabel, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_center(symbolsLabel);
+  pwBtnY += PW_BTN_H + PW_BTN_GAP;
 
   s_pwBackBtn = lv_btn_create(lv_scr_act());
-  lv_obj_set_size(s_pwBackBtn, 70, 99);
-  lv_obj_align(s_pwBackBtn, LV_ALIGN_TOP_RIGHT, -10, 113 + 99 + 4);
+  lv_obj_set_size(s_pwBackBtn, PW_BTN_W, PW_BTN_H);
+  lv_obj_align(s_pwBackBtn, LV_ALIGN_TOP_RIGHT, PW_COL_X, pwBtnY);
   lv_obj_add_event_cb(s_pwBackBtn, onBackToList, LV_EVENT_CLICKED, NULL);
   lv_obj_set_style_radius(s_pwBackBtn, 16, 0);
   lv_obj_set_style_bg_color(s_pwBackBtn, lv_color_hex(0x1e293b), 0);
@@ -539,6 +641,23 @@ static void createSetupScreen() {
   lv_label_set_text(backLabel, LV_SYMBOL_LEFT "\nBack");
   lv_obj_set_style_text_align(backLabel, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_center(backLabel);
+  pwBtnY += PW_BTN_H + PW_BTN_GAP;
+
+  // Toggles between the WiFi password and Server IP fields - see
+  // onTabToggle(), which rewrites this button's own label to name whichever
+  // tab tapping it switches TO.
+  s_tabBtn = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(s_tabBtn, PW_BTN_W, PW_BTN_H);
+  lv_obj_align(s_tabBtn, LV_ALIGN_TOP_RIGHT, PW_COL_X, pwBtnY);
+  lv_obj_add_event_cb(s_tabBtn, onTabToggle, LV_EVENT_CLICKED, NULL);
+  lv_obj_set_style_radius(s_tabBtn, 16, 0);
+  lv_obj_set_style_bg_color(s_tabBtn, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(s_tabBtn, 1, 0);
+  lv_obj_set_style_border_color(s_tabBtn, lv_color_hex(0x22c55e), 0);
+  lv_obj_t *tabLabel = lv_label_create(s_tabBtn);
+  lv_label_set_text(tabLabel, "Server\n" LV_SYMBOL_RIGHT);
+  lv_obj_set_style_text_align(tabLabel, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_center(tabLabel);
 
   s_pwKb = lv_btnmatrix_create(lv_scr_act());
   lv_btnmatrix_set_map(s_pwKb, wifiT9MapLower);

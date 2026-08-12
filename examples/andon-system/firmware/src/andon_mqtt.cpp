@@ -1,4 +1,5 @@
 #include "andon_mqtt.hpp"
+#include "andon_wifi.hpp"
 
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -8,6 +9,12 @@
 
 static WiFiClient s_wifiClient;
 static PubSubClient s_mqtt(s_wifiClient);
+
+// PubSubClient::setServer(const char*, ...) stores the raw pointer, not a
+// copy - a local/temporary String's c_str() would dangle the moment
+// ensureConnected() returns. File-scope keeps it alive for the program's
+// lifetime instead.
+static String s_brokerHostBuf;
 
 static String s_deviceId;
 static volatile bool s_resultReceived = false;
@@ -69,9 +76,15 @@ static bool ensureConnected() {
   // before publish() (it sizes an internal buffer the socket read/write
   // path uses from connection time).
   s_mqtt.setBufferSize(512);
-  s_mqtt.setServer(MQTT_BROKER_HOST, MQTT_BROKER_PORT);
+
+  // Same "Server" tab / NVS host AndonConfig::sync() uses - see
+  // andon_wifi.hpp's getServerHost(). Falls back to secrets.h's
+  // MQTT_BROKER_HOST if nothing's been entered on-device yet.
+  s_brokerHostBuf = AndonWifi::getServerHost();
+  const char *brokerHost = s_brokerHostBuf.length() > 0 ? s_brokerHostBuf.c_str() : MQTT_BROKER_HOST;
+  s_mqtt.setServer(brokerHost, MQTT_BROKER_PORT);
   s_mqtt.setCallback(mqttCallback);
-  Serial.printf("AndonMqtt: connecting to %s:%d...\r\n", MQTT_BROKER_HOST, MQTT_BROKER_PORT);
+  Serial.printf("AndonMqtt: connecting to %s:%d...\r\n", brokerHost, MQTT_BROKER_PORT);
   if (!s_mqtt.connect(deviceId().c_str())) {
     Serial.printf("AndonMqtt: connect failed (state=%d)\r\n", s_mqtt.state());
     return false;
