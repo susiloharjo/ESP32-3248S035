@@ -528,6 +528,17 @@ void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color
 enum AppMode { MODE_NONE, MODE_CHAT, MODE_ANDON };
 static AppMode g_mode = MODE_NONE;
 
+// Backlight idle-dimming was attempted and reverted: TFT_BL and IIC_SCL
+// (touch I2C clock) are both wired to GPIO32 on this board (see
+// include/User_Setup.h). Forcing the pin low between touch polls to darken
+// it changed nothing visible on real hardware - confirmed via serial log
+// (the idle/wake transitions fired correctly) while the backlight stayed
+// lit throughout. Most likely explanation: this board's backlight isn't
+// actually GPIO-controlled at all (hardwired on, as on many cheap CYD
+// boards) and GPIO32's TFT_BL definition doesn't correspond to a real
+// connection - not something fixable in software. Left unimplemented
+// rather than keep code that pokes the shared touch pin for no benefit.
+
 //------------------------------------------------------------------------------
 // Gemini AI chat demo (ported unmodified from examples/gemini-chatbot)
 //------------------------------------------------------------------------------
@@ -1492,24 +1503,13 @@ void start() {
   createChatScreen();
   lv_refr_now(NULL);
 
-  // WiFi: try creds saved in NVS from a previous on-device setup first; if
-  // none are saved (first boot) or they no longer work, fall back to
-  // secrets.h once as a legacy convenience, then finally show the
-  // scan-and-tap setup screen (see runWifiSetupFlow()) rather than requiring
-  // a reflash to change networks.
-  bool wifiConnected = false;
-  String savedSsid, savedPass;
-  if (loadSavedWifi(savedSsid, savedPass)) {
-    lv_label_set_text(chat_response_label, "Connecting to saved WiFi...");
-    lv_refr_now(NULL);
-    wifiConnected = tryConnectWifi(savedSsid, savedPass, chat_response_label);
-  }
-  if (!wifiConnected && strlen(WIFI_SSID) > 0) {
-    lv_label_set_text(chat_response_label, "Connecting to WiFi...");
-    lv_refr_now(NULL);
-    wifiConnected = tryConnectWifi(WIFI_SSID, WIFI_PASSWORD, chat_response_label);
-    if (wifiConnected) saveWifi(WIFI_SSID, WIFI_PASSWORD); // adopt it into NVS going forward
-  }
+  // The shared setup() already tried the saved-creds + secrets.h fallback
+  // (see its comment - it does this up front so andon:: gets a real clock
+  // too, not just this demo) before the mode-select screen even showed.
+  // Retrying the exact same creds here would just re-fail identically after
+  // another ~10-20s of blocking - so either it's already connected, or the
+  // only thing left to try is the on-device setup flow.
+  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
   if (!wifiConnected) {
     Serial.println("No working saved WiFi - starting on-device setup...");
     wifiConnected = runWifiSetupFlow();
@@ -1916,7 +1916,7 @@ static void buildHeader() {
   lv_obj_align(mqttLabel, LV_ALIGN_LEFT_MID, 346, 0);
 
   g_headerTimeLabel = lv_label_create(g_header);
-  lv_label_set_text(g_headerTimeLabel, "08:00"); // dummy - no RTC/NTP in this UI-only build
+  lv_label_set_text(g_headerTimeLabel, "08:00"); // placeholder until tickTimerCb's first tick
   lv_obj_set_style_text_color(g_headerTimeLabel, lv_color_hex(COLOR_TEXT_PRIMARY), 0);
   lv_obj_set_style_text_font(g_headerTimeLabel, &lv_font_montserrat_14, 0);
   lv_obj_align(g_headerTimeLabel, LV_ALIGN_LEFT_MID, 420, 0);
@@ -1941,10 +1941,20 @@ static void clearContent() {
   lv_obj_clean(g_content);
 }
 
-// 1Hz - elapsed/wait counter for whichever screen is showing one. The
-// header clock is a static dummy ("08:00") instead of live uptime - no
-// RTC/NTP in this UI-only build, so there's no real time to show anyway.
+// 1Hz - header clock (real wall time via NTP, same source as chatapp's
+// header - see the shared setup()'s boot-time WiFi/configTime() call) plus
+// elapsed/wait counter for whichever screen is showing one.
 static void tickTimerCb(lv_timer_t *timer) {
+  time_t now = time(nullptr);
+  if (now > 1000000000) { // NTP-synced (after year 2001)
+    struct tm *ti = localtime(&now);
+    char clockBuf[8];
+    snprintf(clockBuf, sizeof(clockBuf), "%02d:%02d", ti->tm_hour, ti->tm_min);
+    lv_label_set_text(g_headerTimeLabel, clockBuf);
+  } else {
+    lv_label_set_text(g_headerTimeLabel, "08:00"); // no NTP sync yet/ever - dummy fallback
+  }
+
   if (g_elapsedLabel) {
     char buf[8];
     formatMMSS(millis() - g_andon.requestOpenedMs, buf, sizeof(buf));
@@ -2527,6 +2537,13 @@ static void showScreenResolved() {
 // Entry point from the mode-select screen - what examples/andon-system's
 // own setup() did after the (now-shared) driver/lvgl/calibration init.
 void start() {
+  // mockConnected intentionally does NOT follow real WiFi status - it's a
+  // demo-only toggle for showing the SCR-04B offline path on purpose (see
+  // headerLongPressCb()), independent from whether the header clock is
+  // real (tickTimerCb checks NTP directly). Defaulting it to the real WiFi
+  // state would make this demo boot into "OFFLINE - LOCAL MODE" instead of
+  // the polished "LINE RUNNING" screen whenever the venue's WiFi is flaky -
+  // exactly the wrong first impression for a demo.
   buildHeader();
   buildContent();
   showScreenNormal();
@@ -2637,6 +2654,35 @@ void setup() {
   Serial.println("Running touch calibration...");
   runTouchCalibration();
 
+  // Connect WiFi once, up front, shared by both demos - so andon::'s clock
+  // can be real (NTP) too, not just chatapp::'s. Same saved-creds-then-
+  // secrets.h fallback chatapp::start() used to do entirely on its own;
+  // it still runs its own on-device setup flow afterward if this didn't
+  // manage to connect (see chatapp::start()).
+  lv_obj_clean(lv_scr_act());
+  lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x0f172a), 0);
+  lv_obj_t *connLabel = lv_label_create(lv_scr_act());
+  lv_label_set_text(connLabel, "Connecting to WiFi...");
+  lv_obj_set_style_text_color(connLabel, lv_color_hex(0xffffff), 0);
+  lv_obj_center(connLabel);
+  lv_refr_now(NULL);
+
+  bool wifiConnected = false;
+  String savedSsid, savedPass;
+  if (chatapp::loadSavedWifi(savedSsid, savedPass)) {
+    wifiConnected = chatapp::tryConnectWifi(savedSsid, savedPass, connLabel);
+  }
+  if (!wifiConnected && strlen(WIFI_SSID) > 0) {
+    wifiConnected = chatapp::tryConnectWifi(WIFI_SSID, WIFI_PASSWORD, connLabel);
+    if (wifiConnected) chatapp::saveWifi(WIFI_SSID, WIFI_PASSWORD);
+  }
+  if (wifiConnected) {
+    Serial.println("WiFi connected - configuring time...");
+    configTime(chatapp::GMT_OFFSET, chatapp::DAYLIGHT_OFFSET, chatapp::NTP_SERVER);
+  } else {
+    Serial.println("No WiFi at boot - each demo can still open its own setup flow.");
+  }
+
   showModeSelectScreen();
   lv_refr_now(NULL);
 
@@ -2645,6 +2691,7 @@ void setup() {
 
 void loop() {
   lv_timer_handler();
+
   // Only the chat demo needs anything extra done here (see loopExtra()'s
   // comment) - the andon demo's per-second work runs entirely off its own
   // lv_timer_create() timer, same as everything else lv_timer_handler()
