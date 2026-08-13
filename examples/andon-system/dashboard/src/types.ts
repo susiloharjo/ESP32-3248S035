@@ -20,9 +20,14 @@ export interface Incident {
   resolvedAt?: string;
 }
 
+// Keyed by (stationId, workOrderId), not stationId alone (2026-08-13) - a
+// station can have several work orders reporting counts independently, see
+// backend/src/production-store.ts's header for why.
 export interface ProductionEntry {
-  productionCount: number;
+  stationId: string;
   workOrderId: string;
+  productionCount: number;
+  updatedAt: string;
 }
 
 export type DashboardEvent =

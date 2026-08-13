@@ -94,18 +94,25 @@ export function renderResolvedList(container: HTMLElement, incidents: Incident[]
     : `<li class="empty-state">Nothing resolved yet.</li>`;
 }
 
-export function renderProductionTiles(container: HTMLElement, production: Record<string, ProductionEntry>): void {
-  const stations = Object.keys(production).sort();
-  container.innerHTML = stations.length
-    ? stations
-        .map((stationId) => {
-          const entry = production[stationId];
-          return `
+// One tile per (station, work order) pair (2026-08-13) - a station can
+// have several work orders reporting counts independently (see
+// backend/src/production-store.ts's header), so this can no longer assume
+// one tile == one station. Sorted by station then work order so a
+// station's tiles group together instead of jumping around as updates
+// arrive in arbitrary order.
+export function renderProductionTiles(container: HTMLElement, production: ProductionEntry[]): void {
+  const sorted = [...production].sort(
+    (a, b) => a.stationId.localeCompare(b.stationId) || a.workOrderId.localeCompare(b.workOrderId),
+  );
+  container.innerHTML = sorted.length
+    ? sorted
+        .map(
+          (entry) => `
       <div class="production-tile">
-        <div class="tile-station">${stationId}<span class="tile-wo">${entry.workOrderId || "—"}</span></div>
+        <div class="tile-station">${entry.stationId}<span class="tile-wo">${entry.workOrderId || "—"}</span></div>
         <div class="tile-count">${entry.productionCount}</div>
-      </div>`;
-        })
+      </div>`,
+        )
         .join("")
     : `<p class="empty-state">No production data yet.</p>`;
 }

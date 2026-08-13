@@ -11,9 +11,9 @@ export async function fetchIncidents(): Promise<Incident[]> {
   return body.incidents;
 }
 
-export async function fetchProduction(): Promise<Record<string, ProductionEntry>> {
+export async function fetchProduction(): Promise<ProductionEntry[]> {
   const res = await fetch("/api/v1/production");
-  const body = (await res.json()) as { production: Record<string, ProductionEntry> };
+  const body = (await res.json()) as { production: ProductionEntry[] };
   return body.production;
 }
 

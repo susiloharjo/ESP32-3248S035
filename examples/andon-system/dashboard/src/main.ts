@@ -15,13 +15,21 @@ const connectionEl = document.querySelector<HTMLElement>("#connection-status")!;
 // all funnel through upsertIncident() so there's one place that decides
 // when to re-render.
 const incidents = new Map<string, Incident>();
-let production: Record<string, ProductionEntry> = {};
+
+// Keyed by "stationId::workOrderId", not stationId alone (2026-08-13) -
+// mirrors backend/src/production-store.ts's keying, so a station with
+// several work orders in flight gets a tile each instead of the latest
+// update overwriting whatever the previous work order's tile showed.
+const production = new Map<string, ProductionEntry>();
+function productionKey(stationId: string, workOrderId: string): string {
+  return `${stationId}::${workOrderId}`;
+}
 
 function renderAll(): void {
   const list = [...incidents.values()];
   renderActiveBoard(boardEl, list);
   renderResolvedList(resolvedEl, list);
-  renderProductionTiles(productionEl, production);
+  renderProductionTiles(productionEl, [...production.values()]);
 }
 
 function upsertIncident(incident: Incident): void {
@@ -34,10 +42,11 @@ function upsertIncident(incident: Incident): void {
 // there's exactly one reconcile code path instead of special-casing the
 // first load.
 async function reconcile(): Promise<void> {
-  const [incidentList, productionData] = await Promise.all([fetchIncidents(), fetchProduction()]);
+  const [incidentList, productionList] = await Promise.all([fetchIncidents(), fetchProduction()]);
   incidents.clear();
   for (const incident of incidentList) incidents.set(incident.incidentId, incident);
-  production = productionData;
+  production.clear();
+  for (const entry of productionList) production.set(productionKey(entry.stationId, entry.workOrderId), entry);
   renderAll();
 }
 
@@ -52,11 +61,13 @@ connectRealtime(
         upsertIncident(event.incident);
         break;
       case "production_updated":
-        production = {
-          ...production,
-          [event.stationId]: { productionCount: event.productionCount, workOrderId: event.workOrderId },
-        };
-        renderProductionTiles(productionEl, production);
+        production.set(productionKey(event.stationId, event.workOrderId), {
+          stationId: event.stationId,
+          workOrderId: event.workOrderId,
+          productionCount: event.productionCount,
+          updatedAt: new Date().toISOString(),
+        });
+        renderProductionTiles(productionEl, [...production.values()]);
         break;
     }
   },
