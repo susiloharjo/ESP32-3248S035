@@ -12,6 +12,7 @@
 #include <TFT_eSPI.h>
 #include <WiFi.h> // WiFi.status() - real header connectivity indicator, see updateHeaderConnDot()
 #include <time.h> // struct tm/getLocalTime/strftime - NTP header clock, see tickTimerCb()
+#include <SD.h> // EXPERIMENT (branch experiment/sdcard-test, 2026-08-13) - see testSdCard()
 
 #include "andon_config.hpp" // reason-list sync from the backend - see setup(), andon_config.cpp
 #include "andon_workorders.hpp" // work-order list sync/selection - see setup(), showScreenWorkOrderList()
@@ -1888,6 +1889,53 @@ static void showScreenResolved() {
              LV_SYMBOL_PLAY "  CONFIRM & RUN", &lv_font_montserrat_16, onConfirmRun, nullptr);
 }
 
+// EXPERIMENT (branch experiment/sdcard-test, 2026-08-13) - "saya naruh
+// sdcard di device ini gimana taunya sdcardnya bisa digunakan". Reuses
+// examples/gemini-chatbot/src/main.cpp's already-proven TF-slot pin (see
+// that file's own comment): TF_CS IO5, MOSI IO23, MISO IO19, CLK IO18 -
+// the ESP32's default VSPI pins, the same bus TFT_eSPI already brought up
+// via tft.begin() (called right before this in setup()), so no separate
+// SPI.begin() call is needed here either. Serial-only report (card
+// present/type/size, root directory listing) - this is purely a "does
+// the hardware even work" check, not wired into any UI/feature yet;
+// nothing here is meant to survive past this branch as-is.
+#define TF_CS 5
+static void testSdCard() {
+  Serial.println("[sdtest] SD.begin(TF_CS)...");
+  if (!SD.begin(TF_CS)) {
+    Serial.println("[sdtest] FAILED - no card detected, wrong CS pin, or card unreadable (needs FAT16/FAT32 format)");
+    return;
+  }
+
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("[sdtest] SD.begin() succeeded but cardType() == CARD_NONE - no card physically present");
+    return;
+  }
+  const char *typeName = cardType == CARD_MMC    ? "MMC"
+                        : cardType == CARD_SD    ? "SDSC"
+                        : cardType == CARD_SDHC  ? "SDHC/SDXC"
+                        : "UNKNOWN";
+  uint64_t sizeMB = SD.cardSize() / (1024 * 1024);
+  Serial.printf("[sdtest] Card detected: type=%s size=%lluMB\r\n", typeName, sizeMB);
+
+  Serial.println("[sdtest] Root directory listing:");
+  File root = SD.open("/");
+  if (!root || !root.isDirectory()) {
+    Serial.println("[sdtest]   (couldn't open / as a directory - card may be corrupt/unformatted)");
+    return;
+  }
+  int fileCount = 0;
+  File entry = root.openNextFile();
+  while (entry) {
+    Serial.printf("[sdtest]   %s%s  (%d bytes)\r\n", entry.isDirectory() ? "[DIR] " : "", entry.name(), entry.size());
+    fileCount++;
+    entry = root.openNextFile();
+  }
+  if (fileCount == 0) Serial.println("[sdtest]   (empty)");
+  Serial.println("[sdtest] Done - SD card is usable.");
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("Starting ESP32-3248S035 Andon System...");
@@ -1902,6 +1950,8 @@ void setup() {
   tft.begin();
   tft.setRotation(1); // landscape
   tft.fillScreen(TFT_BLACK);
+
+  testSdCard(); // EXPERIMENT (branch experiment/sdcard-test) - Serial-only, see its own comment
 
   lv_disp_draw_buf_init(&draw_buf, buf, NULL, screenWidth * 10);
 
