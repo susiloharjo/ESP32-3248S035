@@ -248,7 +248,7 @@ static void showListView() {
 // onPwKeypad()/onSymbolsBtn() don't need to know about tabs at all.
 static void applyTabVisibility() {
   if (s_onServerTab) {
-    lv_label_set_text(s_pwTitle, "Backend server IP");
+    lv_label_set_text(s_pwTitle, "Backend server IP/domain");
     lv_obj_add_flag(s_pwTa, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(s_serverTa, LV_OBJ_FLAG_HIDDEN);
     s_activeTa = s_serverTa;
@@ -589,13 +589,20 @@ static void createSetupScreen() {
   lv_obj_set_style_text_color(s_pwTa, lv_color_hex(0xffffff), 0);
 
   // Same style/position as s_pwTa (only one of the two is ever visible -
-  // see applyTabVisibility()), for the Server tab.
+  // see applyTabVisibility()), for the Server tab. Bare host only - no
+  // "http://" scheme and no ":port" (andon_config.cpp/andon_mqtt.cpp each
+  // append their own fixed port, 8080/MQTT_BROKER_PORT, to whatever's
+  // saved here - see AndonWifi::getServerHost()'s comment). A domain name
+  // works exactly the same as an IP as long as it resolves to the same
+  // host serving both those ports (e.g. the docker-compose backend) -
+  // there's no reverse-proxy/non-default-port support here, out of scope
+  // for this local test harness (see backend/src/server.ts's own note).
   s_serverTa = lv_textarea_create(lv_scr_act());
   lv_obj_set_size(s_serverTa, 460, 40);
   lv_obj_align(s_serverTa, LV_ALIGN_TOP_MID, 0, 35);
   lv_textarea_set_one_line(s_serverTa, true);
   lv_textarea_set_password_mode(s_serverTa, false);
-  lv_textarea_set_placeholder_text(s_serverTa, "Backend IP, e.g. 192.168.1.50");
+  lv_textarea_set_placeholder_text(s_serverTa, "IP or domain, e.g. 192.168.1.50");
   lv_obj_set_style_radius(s_serverTa, 16, 0);
   lv_obj_set_style_border_width(s_serverTa, 2, 0);
   lv_obj_set_style_border_color(s_serverTa, lv_color_hex(0x22c55e), 0);
