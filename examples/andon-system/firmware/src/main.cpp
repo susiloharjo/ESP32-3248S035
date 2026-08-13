@@ -1915,11 +1915,35 @@ static void showScreenResolved() {
 #define TF_SCK  18
 static SPIClass g_sdSpi(VSPI);
 
+// 4MHz alone still failed with a card independently confirmed genuine
+// FAT32 (checked by mounting it on a PC directly, bypassing this board
+// entirely) and physically reseated - so this now retries at the SD
+// spec's own minimum/safest init frequency (400kHz) with a settle delay
+// first, in case the card just needs longer to power up than SD.begin()
+// gives it by default. If this ALSO fails, the remaining explanations
+// are hardware (bad solder joint on the TF connector, worn/misaligned
+// contacts, or missing pull-ups on this board's TF lines), not firmware -
+// there's nothing left on the software side to try.
+static bool trySdBegin(uint32_t freqHz, const char *label) {
+  Serial.printf("[sdtest] SD.begin() at %s...\r\n", label);
+  SD.end(); // undo any previous half-initialized state before retrying
+  bool ok = SD.begin(TF_CS, g_sdSpi, freqHz);
+  Serial.printf("[sdtest]   -> %s\r\n", ok ? "OK" : "failed");
+  return ok;
+}
+
 static void testSdCard() {
-  Serial.println("[sdtest] SPI.begin() + SD.begin() on a dedicated VSPI instance...");
   g_sdSpi.begin(TF_SCK, TF_MISO, TF_MOSI, TF_CS);
-  if (!SD.begin(TF_CS, g_sdSpi, 4000000)) { // 4MHz - conservative first pass, bump later once detection works
-    Serial.println("[sdtest] FAILED - no card detected, wrong CS pin, or card unreadable (needs FAT16/FAT32 format)");
+  delay(250); // let the card's power rail settle before the first command
+
+  bool began = trySdBegin(4000000, "4MHz");
+  if (!began) began = trySdBegin(400000, "400kHz (SD spec's own init-phase minimum)");
+
+  if (!began) {
+    Serial.println("[sdtest] FAILED at both speeds - pins/init/format/physical seating are all"
+                    " already confirmed correct, so this points to a hardware fault on the TF"
+                    " slot itself (bad solder joint, worn contacts, or missing pull-ups), not"
+                    " firmware.");
     return;
   }
 
