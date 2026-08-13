@@ -1,10 +1,12 @@
-# Local dev/test compose for the Digital Andon backend - see
-# ../backend/src/server.ts's header comment for scope (minimal test
-# backend, in-memory only, no auth - not the production deployment
-# agents.md §10/§12 describe). Ports are published on the host so an ESP32
-# on the same LAN can reach them - point secrets.h's CONFIG_API_BASE_URL at
-# this host's LAN IP (not localhost/127.0.0.1 - the device can't resolve
-# that to your machine) and port 8080; MQTT broker is on port 1883.
+# Local dev/test compose for the Digital Andon backend + dashboard - see
+# ../backend/src/server.ts's and ../dashboard/PLAN.md's header/scope notes
+# (minimal test backend, in-memory only, no auth - not the production
+# deployment agents.md §10/§12 describe). Ports are published on the host
+# so an ESP32 on the same LAN can reach the backend - point secrets.h's
+# CONFIG_API_BASE_URL/MQTT_BROKER_HOST at this host's LAN IP (not
+# localhost/127.0.0.1 - the device can't resolve that to your machine),
+# port 8080 for HTTP / 1883 for MQTT. The dashboard is browser-only, so
+# its published port just needs to be reachable from wherever you open it.
 #
 # Run from this directory: `docker compose up --build`
 services:
@@ -13,9 +15,19 @@ services:
       context: ../backend
     container_name: andon-backend
     ports:
-      - "8080:8080" # HTTP - GET /api/v1/configuration/stations/:stationId
+      - "8080:8080" # HTTP - GET /api/v1/configuration/stations/:stationId, /api/v1/incidents, /api/v1/production
       - "1883:1883" # MQTT - andon/v1/... (see architectur.md §8)
     environment:
       HTTP_PORT: "8080"
       MQTT_PORT: "1883"
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ../dashboard
+    container_name: andon-dashboard
+    ports:
+      - "8090:80" # nginx.conf reverse-proxies /api/* to the backend service by Docker DNS name
+    depends_on:
+      - backend
     restart: unless-stopped

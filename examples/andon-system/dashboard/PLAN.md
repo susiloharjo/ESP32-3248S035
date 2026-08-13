@@ -1,5 +1,7 @@
 # Dashboard Demo Implementation Plan — Digital Andon System
 
+**Status (2026-08-13): built and verified end-to-end.** All of §9's build order (backend incident/production store + REST + WebSocket, frontend Vite app, `deploy/docker-compose.yml` wiring) is done. Verified via headless browser against the real `docker compose up --build` stack (not just `vite dev`): MQTT `ANDON_REQUESTED` → alert banner + card appear live, Acknowledge/Start Handling/Resolve buttons drive the full lifecycle, `PRODUCTION_COUNT_UPDATED` updates its tile live, resolved incidents move to the sidebar list, zero browser console errors. §8's MQTT-subscribe gap is unchanged (still device-side future work, tracked there, not here).
+
 | Field | Value |
 |---|---|
 | Scope | `examples/andon-system/dashboard/` (new) + a small, explicit extension to `backend/` — the current backend can't back an interactive dashboard as-is (see §2) |

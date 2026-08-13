@@ -1,0 +1,115 @@
+// Plain DOM rendering - no framework (PLAN.md §3: "a demo with one page,
+// a handful of cards, and a WebSocket listener doesn't need React/etc.'s
+// overhead"). Each render* function owns one container and fully replaces
+// its contents - cheap enough at this scale (a handful of incidents) that
+// there's no need for a diffing layer.
+
+import type { Incident } from "./types";
+import { CATEGORY_COLORS, STATUS_COLORS } from "./tokens";
+
+function formatAge(openedAt: string): string {
+  const elapsedMs = Date.now() - new Date(openedAt).getTime();
+  const totalSec = Math.max(0, Math.floor(elapsedMs / 1000));
+  const mm = Math.floor(totalSec / 60);
+  const ss = totalSec % 60;
+  return `${mm}:${String(ss).padStart(2, "0")}`;
+}
+
+// Called once a second (see main.ts) to tick every visible age label
+// without re-rendering the whole board just for a clock.
+export function tickAges(): void {
+  document.querySelectorAll<HTMLElement>("[data-opened-at]").forEach((el) => {
+    el.textContent = formatAge(el.dataset.openedAt!);
+  });
+}
+
+const NEXT_ACTION: Record<string, { action: string; label: string } | undefined> = {
+  OPEN: { action: "acknowledge", label: "Acknowledge" },
+  ACKNOWLEDGED: { action: "start-handling", label: "Start Handling" },
+  HANDLING: { action: "resolve", label: "Resolve" },
+};
+
+function incidentCard(incident: Incident): string {
+  const categoryColor = CATEGORY_COLORS[incident.categoryCode] ?? "#52636C";
+  const statusColor = STATUS_COLORS[incident.status] ?? "#52636C";
+  const next = NEXT_ACTION[incident.status];
+  const actionHtml = next
+    ? `<button class="action-btn" data-incident-id="${incident.incidentId}" data-action="${next.action}" style="background:${categoryColor}">${next.label}</button>`
+    : "";
+
+  return `
+    <article class="card" style="border-color:${categoryColor}">
+      <div class="card-top">
+        <span class="badge" style="background:${categoryColor}">${incident.categoryCode}</span>
+        <span class="status-pill" style="color:${statusColor};border-color:${statusColor}">${incident.status}</span>
+      </div>
+      <div class="card-reason">${incident.reasonCode}</div>
+      <div class="card-meta">
+        <span>${incident.stationId}</span>
+        <span data-opened-at="${incident.openedAt}">${formatAge(incident.openedAt)}</span>
+      </div>
+      ${actionHtml}
+    </article>
+  `;
+}
+
+export function renderActiveBoard(container: HTMLElement, incidents: Incident[]): void {
+  const active = incidents.filter((i) => i.status !== "RESOLVED");
+  container.innerHTML = active.length
+    ? active.map(incidentCard).join("")
+    : `<p class="empty-state">No active incidents.</p>`;
+}
+
+export function renderResolvedList(container: HTMLElement, incidents: Incident[]): void {
+  const resolved = incidents
+    .filter((i) => i.status === "RESOLVED")
+    .sort((a, b) => (b.resolvedAt ?? "").localeCompare(a.resolvedAt ?? ""))
+    .slice(0, 10);
+
+  container.innerHTML = resolved.length
+    ? resolved
+        .map(
+          (i) => `
+      <li>
+        <span class="badge" style="background:${CATEGORY_COLORS[i.categoryCode] ?? "#52636C"}">${i.categoryCode}</span>
+        ${i.reasonCode} — ${i.stationId}
+        <span class="resolved-at">${i.resolvedAt ? new Date(i.resolvedAt).toLocaleTimeString() : ""}</span>
+      </li>`,
+        )
+        .join("")
+    : `<li class="empty-state">Nothing resolved yet.</li>`;
+}
+
+export function renderProductionTiles(container: HTMLElement, production: Record<string, number>): void {
+  const stations = Object.keys(production).sort();
+  container.innerHTML = stations.length
+    ? stations
+        .map(
+          (stationId) => `
+      <div class="production-tile">
+        <div class="tile-station">${stationId}</div>
+        <div class="tile-count">${production[stationId]}</div>
+      </div>`,
+        )
+        .join("")
+    : `<p class="empty-state">No production data yet.</p>`;
+}
+
+export function renderConnectionStatus(el: HTMLElement, connected: boolean): void {
+  el.textContent = connected ? "● Connected" : "○ Reconnecting…";
+  el.style.color = connected ? "#35C759" : "#F2A914";
+}
+
+// PLAN.md §4.1: fires only for a brand-new call (incident_created), never
+// on a status transition. Auto-dismisses; the active board (not this
+// toast) is the source of truth for what still needs attention.
+export function showAlert(container: HTMLElement, incident: Incident): void {
+  const color = CATEGORY_COLORS[incident.categoryCode] ?? "#52636C";
+  const el = document.createElement("div");
+  el.className = "alert-banner";
+  el.style.background = color;
+  el.innerHTML = `<strong>${incident.categoryCode}</strong> called at <strong>${incident.stationId}</strong> — ${incident.reasonCode}`;
+  el.addEventListener("click", () => el.remove());
+  container.appendChild(el);
+  setTimeout(() => el.remove(), 8000);
+}

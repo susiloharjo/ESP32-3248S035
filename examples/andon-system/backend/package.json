@@ -9,11 +9,13 @@
     "start": "node dist/server.js"
   },
   "dependencies": {
+    "@fastify/websocket": "^10.0.1",
     "aedes": "^0.51.3",
     "fastify": "^4.28.1"
   },
   "devDependencies": {
     "@types/node": "^20.14.10",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.16.2",
     "typescript": "^5.5.4"
   }

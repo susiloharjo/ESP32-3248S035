@@ -1,0 +1,216 @@
+/* Dark theme using design.md §5.1's tokens directly (see tokens.ts) -
+   duplicated as CSS custom properties here since this file can't import
+   the TS constants; keep the two in sync by hand if the palette changes. */
+:root {
+  --bg-base: #07131C;
+  --bg-panel: #10212C;
+  --bg-raised: #162A36;
+  --border: #3E535F;
+  --text-primary: #F4F7FA;
+  --text-secondary: #AFC0C9;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+  font-size: 18px;
+  margin: 0;
+}
+
+#connection-status {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+main {
+  padding: 20px;
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 20px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+section {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+section h2 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+#active-board {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.card {
+  background: var(--bg-raised);
+  border: 2px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.card-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.status-pill {
+  font-size: 11px;
+  font-weight: 700;
+  border: 1px solid;
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.card-reason {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.card-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.action-btn {
+  border: none;
+  border-radius: 6px;
+  padding: 8px;
+  font-weight: 700;
+  color: #0f172a;
+  cursor: pointer;
+}
+
+.action-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+#production-tiles {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.production-tile {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.tile-station {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.tile-count {
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+#resolved-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+}
+
+#resolved-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+}
+
+.resolved-at {
+  margin-left: auto;
+}
+
+.empty-state {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+/* PLAN.md §4.1 - stacked toasts, top-right, click to dismiss early */
+#alerts {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 100;
+}
+
+.alert-banner {
+  color: #0f172a;
+  padding: 12px 16px;
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+  min-width: 240px;
+  animation: alert-in 0.2s ease-out;
+}
+
+@keyframes alert-in {
+  from { transform: translateX(20px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}

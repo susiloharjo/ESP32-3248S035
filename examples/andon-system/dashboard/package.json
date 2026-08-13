@@ -1,0 +1,16 @@
+{
+  "name": "andon-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Demo supervisor dashboard for the Digital Andon system - see PLAN.md for scope.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "vite": "^5.4.0"
+  }
+}
