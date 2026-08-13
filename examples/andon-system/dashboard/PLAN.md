@@ -30,7 +30,10 @@ A dashboard that's actually "interaktif" per the request needs all of the above 
   - `POST /api/v1/incidents/:id/start-handling`
   - `POST /api/v1/incidents/:id/resolve`
   - `GET /api/v1/production` — current count per station (replaces the ad-hoc `/debug/production/:stationId`, returns all stations at once)
-- A WebSocket endpoint (`@fastify/websocket`, since Fastify's already the HTTP framework) broadcasting `{type: "incident_updated", incident}` / `{type: "production_updated", stationId, productionCount}` to all connected dashboard clients whenever state changes — from a new incident, a REST action above, or an MQTT event.
+- A WebSocket endpoint (`@fastify/websocket`, since Fastify's already the HTTP framework) broadcasting to all connected dashboard clients whenever state changes — from a new incident, a REST action above, or an MQTT event. Two distinct incident message types, not one, specifically so the frontend can tell "brand new call" apart from "status changed on something already visible" (see §4.1 - only the former should trigger the alert):
+  - `{type: "incident_created", incident}` — fired once, exactly when a new `ANDON_REQUESTED` MQTT event creates a record
+  - `{type: "incident_updated", incident}` — fired on every subsequent state change (acknowledge/start-handling/resolve)
+  - `{type: "production_updated", stationId, productionCount}` — fired on every `PRODUCTION_COUNT_UPDATED` MQTT event
 - Each REST action **also publishes an MQTT message** (`andon/v1/device/{deviceId}/state`, new topic — nothing currently subscribes to it) reflecting the change, so the firmware has something real to subscribe to *whenever* that gets built (see §8) — this dashboard doesn't wait for firmware subscribe support to be useful on its own via the web view, but shouldn't design itself into a corner that makes wiring firmware up later harder.
 
 **Frontend**: one page, no login.
@@ -38,7 +41,7 @@ A dashboard that's actually "interaktif" per the request needs all of the above 
 - **Active board**: cards/rows for incidents in `OPEN`/`ACKNOWLEDGED`/`HANDLING`, grouped/sortable by station, each showing category, reason, station, age (live-ticking), status — matches `agents.md` §11's "show category, station, age, status, owner... without opening detail."
 - Each card has the one explicit action valid for its current state (`agents.md` §11: "require explicit action") — Acknowledge on `OPEN`, Start Handling on `ACKNOWLEDGED`, Resolve on `HANDLING` — calling the matching REST endpoint above.
 - Resolved incidents drop into a simple "Recently resolved" list (not full history/filtering — that's WEB-004, out of scope here).
-- A small production-count tile per known station, updating live off the WebSocket feed.
+- A small production-count tile per known station, **updating live off the WebSocket feed, no polling** — the whole point of the request that prompted this section: the count on screen should move the instant `PRODUCTION_COUNT_UPDATED` arrives, same as the active board.
 - WebSocket-fed live updates; falls back to the `GET /api/v1/incidents` list on reconnect (`agents.md` §11: "use live updates but reconcile from REST after reconnect" — cheap to honor even at demo scope, and it's the one architectural rule here that's genuinely free to get right from day one).
 
 ## 3. Stack
@@ -52,19 +55,28 @@ A dashboard that's actually "interaktif" per the request needs all of the above 
 | Area | Shows | Actions |
 |---|---|---|
 | Header | Connection status (WebSocket connected/reconnecting), station filter (if >1 station appears) | — |
+| **Alert banner** | Fires on a brand-new call only (see §4.1) — category + station + reason, category-colored | Dismiss (or auto-dismiss ~8s) |
 | Active board | Incident cards: category badge (color per `design.md` §5.1's category tokens, reused for visual consistency with the terminal), reason, station, live age timer, status pill | Acknowledge / Start Handling / Resolve (one per card, matching current state) |
-| Production tile(s) | Latest count per station, last-updated timestamp | — |
+| Production tile(s) | Latest count per station, last-updated timestamp, **updates live off WebSocket push (no polling)** | — |
 | Recently resolved | Last N resolved incidents (downtime, handled-by placeholder — no real user/auth yet so this is just "resolved via dashboard") | — |
+
+### 4.1 Andon-call alert
+
+The active board alone (a card quietly appearing in a list) doesn't read as "someone needs help right now" - a real Andon call should interrupt whoever's looking at the dashboard, matching the physical world it's replacing (a light/alarm that demands attention, not a line item). On `incident_created` (never on `incident_updated` - an Ack/Handling/Resolve transition shouldn't re-alert):
+
+- A prominent banner/toast, category-colored (reuse `design.md` §5.1's `fault`/`quality`/`material`/`waiting` tokens - same visual language as the terminal, per `agents.md` §11 "keep operator terminal wording consistent with HMI labels"), showing category + station + reason.
+- Auto-dismisses after ~8s - it's a *notice*, not the record of the incident. The incident itself stays fully visible and actionable in the active board regardless of whether the toast was seen or already faded; the board, not the toast, is the source of truth for "still needs attention."
+- Audio alert: worth having but flagged as a stretch item, not baseline - browsers block autoplaying sound before any user interaction on the page, so a first-load call could arrive silently no matter what's built. Needs either an explicit "enable sound" affordance or accepting that constraint; decide when this gets built, not speculatively now.
 
 ## 5. Data flow
 
 ```
 ESP32 --MQTT ANDON_REQUESTED--> backend --stores incident, replies COMMAND_RESULT--> ESP32
                                     |
-                                    +--broadcasts incident_updated--> dashboard (WebSocket)
+                                    +--broadcasts incident_created--> dashboard (WebSocket, triggers §4.1's alert)
 
 dashboard --POST /incidents/:id/acknowledge--> backend --updates record-->
-    +--broadcasts incident_updated--> all dashboard clients
+    +--broadcasts incident_updated--> all dashboard clients (no alert - see §4.1)
     +--publishes andon/v1/device/{id}/state--> MQTT (unconsumed by firmware today, see §8)
 ```
 
