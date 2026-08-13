@@ -1323,8 +1323,14 @@ static void showScreenNormal() {
   int unit = (CONTENT_W - 2 * MARGIN - gap2) / 3;
   int iconY = 210, iconH = 62;
 
-  makeButton(g_content, MARGIN, iconY, unit, iconH, COLOR_MATERIAL,
-             LV_SYMBOL_EDIT, &lv_font_montserrat_28, onOpenUpdateProduction, nullptr);
+  // Green + icon (was blue pencil/LV_SYMBOL_EDIT) - explicit request
+  // (2026-08-13), tying its color to the LINE RUNNING banner above rather
+  // than a generic "edit" affordance. Deviates from this row's original
+  // "only NEED ASSISTANCE is color-coded, the other two stay neutral so
+  // nothing competes with it" rule (see design.md's SCR-01 changelog) -
+  // recorded there too, not silently left stale.
+  makeButton(g_content, MARGIN, iconY, unit, iconH, COLOR_RUNNING,
+             LV_SYMBOL_PLUS, &lv_font_montserrat_28, onOpenUpdateProduction, nullptr);
   // Amber, not red - red is reserved for "there's an active fault" states
   // elsewhere (MAINTENANCE CALLED banner, STATUS: OPEN, etc.); using it here
   // too would make this entry point look like a fault already exists before
