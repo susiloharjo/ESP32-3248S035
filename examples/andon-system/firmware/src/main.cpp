@@ -621,7 +621,7 @@ enum AndonScreenId {
 // resolved a real one (first boot, no cache, no network) - matches
 // andon_workorders.cpp's applyPlaceholder(). Once a work order is fetched
 // or selected, g_andon.productionTarget carries that WO's real target
-// instead (see onWorkOrderTap()).
+// instead (see onWorkOrderSelect()).
 #define PRODUCTION_TARGET 120
 
 struct AndonState {
@@ -636,7 +636,7 @@ struct AndonState {
   String incidentId = "";    // backend-assigned - set once AndonMqtt::submitAndonRequest() actually returns ACCEPTED (see submitRequest()); empty while queued/offline
   // Work order the operator is currently producing against - restored/
   // fetched by AndonWorkOrders::sync() in setup(), changeable via
-  // SCR_WORK_ORDER_LIST (see onWorkOrderTap()). Defaults match the single
+  // SCR_WORK_ORDER_LIST (see onWorkOrderSelect()). Defaults match the single
   // hardcoded placeholder this firmware used before that module existed,
   // so the terminal is still demoable before sync() ever runs.
   String workOrderId = "WO-240811-07";
@@ -1065,23 +1065,25 @@ static void onNeedAssistance(lv_event_t *e) { showScreenCategory(); }
 
 // Now opens the work-order picker first (SCR_WORK_ORDER_LIST) instead of
 // going straight to the counter - operator picks which WO they're
-// producing against, then updates the count for it (see onWorkOrderTap()).
+// producing against, then updates the count for it (see onWorkOrderSelect()).
 static void onOpenUpdateProduction(lv_event_t *e) {
   showScreenWorkOrderList();
 }
 
-// Tapped from SCR_WORK_ORDER_LIST - commits the selection (persisted via
-// AndonWorkOrders::select(), survives reboot), pulls that WO's real target
-// into g_andon, then proceeds straight into the counter screen (matches
-// the old onOpenUpdateProduction() entry behavior).
-static void onWorkOrderTap(lv_event_t *e) {
-  intptr_t idx = (intptr_t)lv_event_get_user_data(e);
-  AndonWorkOrders::select((int)idx);
-  g_andon.workOrderId = AndonWorkOrders::workOrderId((int)idx);
-  g_andon.productionTarget = AndonWorkOrders::target((int)idx);
-  g_productionEditValue = g_andon.productionCount; // edit a scratch copy so CANCEL can discard it
-  showScreenUpdateProduction();
-}
+// SCR_WORK_ORDER_LIST's Up/Down/Select - a scrolling cursor over
+// AndonWorkOrders' list rather than tapping a row directly, same pattern
+// as andon_wifi.cpp's network list (rows aren't clickable there either -
+// see its updateListRows()/onUp()/onDown()/onSelect()). Explicit request
+// (2026-08-13): "jaga2 kalau lebih dr 3 listnya" - only 3 rows are ever
+// shown at once (WORK_ORDER_LIST_VISIBLE_ROWS), so a station with more
+// work orders than that still needs a way to reach the rest; direct-tap
+// rows can't do that without pagination anyway, so this switches to the
+// same cursor+Select model everywhere instead of two different list UX
+// patterns in one firmware. g_woListCursor/updateWorkOrderListRows() are
+// defined just above showScreenWorkOrderList() below.
+static void onWorkOrderUp(lv_event_t *e);
+static void onWorkOrderDown(lv_event_t *e);
+static void onWorkOrderSelect(lv_event_t *e);
 
 static void onWorkOrderListBack(lv_event_t *e) { showScreenNormal(); }
 
@@ -1391,12 +1393,81 @@ static void showScreenUpdateProduction() {
 // onOpenUpdateProduction()). Not one of design.md's numbered screens, same
 // "new scope" status as SCR_UPDATE_PRODUCTION above. List comes from
 // AndonWorkOrders (fetched/cached/placeholder-fallback, see
-// andon_workorders.cpp) - up to 3 rows shown at once, no scrolling
-// (ANDON_WO_MAX is 8; a longer list would need the same up/down paging
-// AndonWifi's screen uses, not built here yet - this station's seed data
-// is only 3). Every row's top edge sits well past the y~113 touch dead
-// zone (see the CONTENT_W/MARGIN/GAP comment block above).
-#define WORK_ORDER_LIST_MAX_ROWS 3
+// andon_workorders.cpp) - only WORK_ORDER_LIST_VISIBLE_ROWS shown at once,
+// with an Up/Down cursor + Select button on the right so a station with
+// more work orders than that still has a way to reach the rest (explicit
+// request, 2026-08-13: "jaga2 kalau lebih dr 3 listnya"). Rows themselves
+// aren't clickable - same non-tappable-list/cursor+Select pattern as
+// andon_wifi.cpp's network list, reused here instead of inventing a
+// second list UX (see that file's updateListRows()/onUp()/onDown()/
+// onSelect() for the pattern this mirrors).
+#define WORK_ORDER_LIST_VISIBLE_ROWS 3
+static lv_obj_t *g_woListRows[WORK_ORDER_LIST_VISIBLE_ROWS] = {nullptr};
+static lv_obj_t *g_woListRowLabels[WORK_ORDER_LIST_VISIBLE_ROWS] = {nullptr};
+static int g_woListCursor = 0; // index into AndonWorkOrders' list, not a screen-row index
+
+// Repaints the visible window around g_woListCursor - called on Up/Down as
+// well as once from showScreenWorkOrderList() itself. Centers the cursor
+// within the window like andon_wifi.cpp's updateListRows() does, clamped
+// to the list's ends.
+static void updateWorkOrderListRows() {
+  int n = AndonWorkOrders::count();
+  if (n <= 0) {
+    lv_label_set_text(g_woListRowLabels[0], "No work orders available");
+    lv_obj_clear_flag(g_woListRows[0], LV_OBJ_FLAG_HIDDEN);
+    for (int i = 1; i < WORK_ORDER_LIST_VISIBLE_ROWS; i++) lv_obj_add_flag(g_woListRows[i], LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+
+  int start = g_woListCursor - WORK_ORDER_LIST_VISIBLE_ROWS / 2;
+  if (start > n - WORK_ORDER_LIST_VISIBLE_ROWS) start = n - WORK_ORDER_LIST_VISIBLE_ROWS;
+  if (start < 0) start = 0;
+
+  int selectedIdx = AndonWorkOrders::selectedIndex();
+  for (int i = 0; i < WORK_ORDER_LIST_VISIBLE_ROWS; i++) {
+    int idx = start + i;
+    if (idx >= n) {
+      lv_obj_add_flag(g_woListRows[i], LV_OBJ_FLAG_HIDDEN);
+      continue;
+    }
+    lv_obj_clear_flag(g_woListRows[i], LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text_fmt(g_woListRowLabels[i], "%s%s\n%s - target %d",
+                           (idx == selectedIdx) ? LV_SYMBOL_OK " " : "",
+                           AndonWorkOrders::workOrderId(idx),
+                           AndonWorkOrders::product(idx), AndonWorkOrders::target(idx));
+    bool highlighted = (idx == g_woListCursor);
+    lv_obj_set_style_bg_color(g_woListRows[i], highlighted ? lv_color_hex(COLOR_RUNNING) : lv_color_hex(COLOR_BG_RAISED), 0);
+    lv_obj_set_style_text_color(g_woListRowLabels[i], highlighted ? lv_color_hex(0x0f172a) : lv_color_hex(COLOR_TEXT_PRIMARY), 0);
+  }
+}
+
+static void onWorkOrderUp(lv_event_t *e) {
+  int n = AndonWorkOrders::count();
+  if (n <= 0) return;
+  g_woListCursor = (g_woListCursor - 1 + n) % n;
+  updateWorkOrderListRows();
+}
+
+static void onWorkOrderDown(lv_event_t *e) {
+  int n = AndonWorkOrders::count();
+  if (n <= 0) return;
+  g_woListCursor = (g_woListCursor + 1) % n;
+  updateWorkOrderListRows();
+}
+
+// Commits g_woListCursor as the new selection (persisted via
+// AndonWorkOrders::select(), survives reboot), pulls that WO's real target
+// into g_andon, then proceeds straight into the counter screen (matches
+// the old direct-tap entry behavior).
+static void onWorkOrderSelect(lv_event_t *e) {
+  if (AndonWorkOrders::count() <= 0) return;
+  AndonWorkOrders::select(g_woListCursor);
+  g_andon.workOrderId = AndonWorkOrders::workOrderId(g_woListCursor);
+  g_andon.productionTarget = AndonWorkOrders::target(g_woListCursor);
+  g_productionEditValue = g_andon.productionCount; // edit a scratch copy so CANCEL can discard it
+  showScreenUpdateProduction();
+}
+
 static void showScreenWorkOrderList() {
   g_andon.screen = SCR_WORK_ORDER_LIST;
   clearContent();
@@ -1407,36 +1478,61 @@ static void showScreenWorkOrderList() {
   lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
 
-  int n = AndonWorkOrders::count();
-  if (n == 0) {
-    lv_obj_t *empty = lv_label_create(g_content);
-    lv_label_set_text(empty, "No work orders available.");
-    lv_obj_set_style_text_color(empty, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
-    lv_obj_set_style_text_font(empty, &lv_font_montserrat_16, 0);
-    lv_obj_align(empty, LV_ALIGN_TOP_MID, 0, 130);
-  } else {
-    int rows = n < WORK_ORDER_LIST_MAX_ROWS ? n : WORK_ORDER_LIST_MAX_ROWS;
-    const int rowY0 = 44, rowH = 50, rowGap = 6;
-    int selectedIdx = AndonWorkOrders::selectedIndex();
-    for (int i = 0; i < rows; i++) {
-      char rowText[80];
-      snprintf(rowText, sizeof(rowText), "%s %s\n%s - target %d",
-               (i == selectedIdx) ? LV_SYMBOL_OK : " ",
-               AndonWorkOrders::workOrderId(i),
-               AndonWorkOrders::product(i), AndonWorkOrders::target(i));
-      lv_obj_t *row = makeButton(g_content, MARGIN, rowY0 + i * (rowH + rowGap),
-                                  CONTENT_W - 2 * MARGIN, rowH,
-                                  (i == selectedIdx) ? COLOR_RUNNING : COLOR_BG_RAISED,
-                                  rowText, &lv_font_montserrat_14, onWorkOrderTap, (void *)(intptr_t)i);
-      lv_obj_t *label = lv_obj_get_child(row, 0);
-      lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
-      lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
-      lv_obj_align(label, LV_ALIGN_LEFT_MID, 8, 0);
-    }
+  // List box on the left - same visual language as makeMetricCard3's
+  // panels (stylePanel()), rows created fresh every time this screen is
+  // shown (clearContent() wiped the previous ones, if any).
+  const int listX = MARGIN, listY = 44, listW = 300, listH = 176;
+  lv_obj_t *listBox = lv_obj_create(g_content);
+  lv_obj_set_pos(listBox, listX, listY);
+  lv_obj_set_size(listBox, listW, listH);
+  stylePanel(listBox);
+  lv_obj_set_style_pad_all(listBox, 4, 0);
+  lv_obj_clear_flag(listBox, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(listBox, LV_OBJ_FLAG_CLICKABLE);
+
+  const int rowH = 52, rowGap = 4;
+  for (int i = 0; i < WORK_ORDER_LIST_VISIBLE_ROWS; i++) {
+    g_woListRows[i] = lv_obj_create(listBox);
+    lv_obj_set_size(g_woListRows[i], listW - 8, rowH);
+    lv_obj_set_pos(g_woListRows[i], 0, i * (rowH + rowGap));
+    lv_obj_set_style_border_width(g_woListRows[i], 1, 0);
+    lv_obj_set_style_border_color(g_woListRows[i], lv_color_hex(COLOR_BORDER), 0);
+    lv_obj_set_style_radius(g_woListRows[i], 6, 0);
+    lv_obj_set_style_pad_all(g_woListRows[i], 0, 0);
+    lv_obj_clear_flag(g_woListRows[i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(g_woListRows[i], LV_OBJ_FLAG_CLICKABLE); // Up/Down+Select drives this, not direct taps
+
+    g_woListRowLabels[i] = lv_label_create(g_woListRows[i]);
+    lv_obj_set_style_text_font(g_woListRowLabels[i], &lv_font_montserrat_14, 0);
+    lv_label_set_long_mode(g_woListRowLabels[i], LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(g_woListRowLabels[i], listW - 8 - 16);
+    lv_obj_align(g_woListRowLabels[i], LV_ALIGN_LEFT_MID, 8, 0);
   }
 
-  makeButton(g_content, MARGIN, 216, CONTENT_W - 2 * MARGIN, 56, COLOR_DISABLED,
-             LV_SYMBOL_LEFT "  BACK", &lv_font_montserrat_18, onWorkOrderListBack, nullptr);
+  // Clamp the cursor to the (possibly-changed-since-last-visit) list
+  // before the first paint, same as showScreenWorkOrderList() being
+  // re-entered after a sync() picked up a shorter/longer list.
+  int n = AndonWorkOrders::count();
+  if (n <= 0) g_woListCursor = 0;
+  else if (g_woListCursor >= n) g_woListCursor = n - 1;
+  updateWorkOrderListRows();
+
+  // Right column: Up / Select / Down / Back - same 4-button vertical
+  // layout as andon_wifi.cpp's network list (COL2_X/ROW_H there), reused
+  // at this screen's own coordinates.
+  const int colX = listX + listW + GAP, colW = CONTENT_W - MARGIN - colX, rowGap2 = 6, btnH = 38;
+  int colY = listY;
+  makeButton(g_content, colX, colY, colW, btnH, COLOR_BG_RAISED, LV_SYMBOL_UP,
+             &lv_font_montserrat_18, onWorkOrderUp, nullptr);
+  colY += btnH + rowGap2;
+  makeButton(g_content, colX, colY, colW, btnH, COLOR_RUNNING, "SELECT",
+             &lv_font_montserrat_14, onWorkOrderSelect, nullptr);
+  colY += btnH + rowGap2;
+  makeButton(g_content, colX, colY, colW, btnH, COLOR_BG_RAISED, LV_SYMBOL_DOWN,
+             &lv_font_montserrat_18, onWorkOrderDown, nullptr);
+  colY += btnH + rowGap2;
+  makeButton(g_content, colX, colY, colW, btnH, COLOR_DISABLED, LV_SYMBOL_LEFT " Back",
+             &lv_font_montserrat_14, onWorkOrderListBack, nullptr);
 }
 
 // SCR-02 - Category selection
