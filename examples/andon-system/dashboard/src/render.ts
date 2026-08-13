@@ -111,7 +111,10 @@ export function renderProductionTiles(container: HTMLElement, production: Produc
           (entry) => `
       <div class="production-tile">
         <div class="tile-station">${entry.stationId}<span class="tile-wo">${entry.workOrderId || "—"}</span></div>
-        <div class="tile-count">${entry.productionCount}</div>
+        <div class="tile-counts">
+          <div class="tile-count-block"><span class="tile-count">${entry.productionCount}</span><span class="tile-count-label">good</span></div>
+          <div class="tile-count-block tile-count-block-reject"><span class="tile-count-reject">${entry.rejectCount}</span><span class="tile-count-label">reject</span></div>
+        </div>
       </div>`,
         )
         .join("")
