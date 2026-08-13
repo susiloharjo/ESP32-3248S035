@@ -1891,18 +1891,34 @@ static void showScreenResolved() {
 
 // EXPERIMENT (branch experiment/sdcard-test, 2026-08-13) - "saya naruh
 // sdcard di device ini gimana taunya sdcardnya bisa digunakan". Reuses
-// examples/gemini-chatbot/src/main.cpp's already-proven TF-slot pin (see
-// that file's own comment): TF_CS IO5, MOSI IO23, MISO IO19, CLK IO18 -
-// the ESP32's default VSPI pins, the same bus TFT_eSPI already brought up
-// via tft.begin() (called right before this in setup()), so no separate
-// SPI.begin() call is needed here either. Serial-only report (card
-// present/type/size, root directory listing) - this is purely a "does
-// the hardware even work" check, not wired into any UI/feature yet;
-// nothing here is meant to survive past this branch as-is.
-#define TF_CS 5
+// the TF-slot pins confirmed straight off docs/pcb-layout.jpg's own
+// silkscreen labels (TF_CS IO5, MOSI IO23, MISO IO19, CLK IO18 - the
+// ESP32's default VSPI pins) - same pins examples/gemini-chatbot/src/
+// main.cpp's older comment already claimed, and same ones
+// https://randomnerdtutorials.com/esp32-cyd-display-touchscreen-microsd-card/
+// independently confirms for this board family.
+//
+// First cut of this test (see git log) called bare SD.begin(TF_CS),
+// assuming TFT_eSPI's tft.begin() already left the VSPI bus in a state
+// the SD library could just piggyback on - that produced "Card Failed!
+// cmd: 0x00" (fails before the filesystem layer even engages) even with
+// a freshly-formatted card physically inserted. The tutorial above does
+// it differently: an explicit, separate SPIClass(VSPI) instance,
+// .begin()'d with the exact pins, handed to SD.begin() instead of
+// relying on whatever TFT_eSPI already set up - that's what this does
+// now. (The tutorial's touch/SD VSPI-conflict warning doesn't apply
+// here - this firmware's touch driver is bit-banged I2C (gt911_init()),
+// not SPI, so only the display and SD actually share this bus.)
+#define TF_CS   5
+#define TF_MOSI 23
+#define TF_MISO 19
+#define TF_SCK  18
+static SPIClass g_sdSpi(VSPI);
+
 static void testSdCard() {
-  Serial.println("[sdtest] SD.begin(TF_CS)...");
-  if (!SD.begin(TF_CS)) {
+  Serial.println("[sdtest] SPI.begin() + SD.begin() on a dedicated VSPI instance...");
+  g_sdSpi.begin(TF_SCK, TF_MISO, TF_MOSI, TF_CS);
+  if (!SD.begin(TF_CS, g_sdSpi, 4000000)) { // 4MHz - conservative first pass, bump later once detection works
     Serial.println("[sdtest] FAILED - no card detected, wrong CS pin, or card unreadable (needs FAT16/FAT32 format)");
     return;
   }
