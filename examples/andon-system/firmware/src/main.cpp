@@ -1129,6 +1129,11 @@ static void onProductionCancel(lv_event_t *e) { showScreenNormal(); } // discard
 // during the blocking wait" note).
 static void onProductionConfirm(lv_event_t *e) {
   g_andon.productionCount = g_productionEditValue;
+  // Persist against the selected work order specifically - see
+  // onWorkOrderSelect()'s comment for the bug this (together with that
+  // function reading it back) fixes.
+  int selIdx = AndonWorkOrders::selectedIndex();
+  if (selIdx >= 0) AndonWorkOrders::setProductionCount(selIdx, g_andon.productionCount);
   bool acked = AndonMqtt::submitProductionUpdate(g_andon.productionCount, g_andon.workOrderId.c_str());
   Serial.printf("[production] count=%d wo=%s backend_acked=%d\r\n",
                 g_andon.productionCount, g_andon.workOrderId.c_str(), acked);
@@ -1462,14 +1467,23 @@ static void onWorkOrderDown(lv_event_t *e) {
 }
 
 // Commits g_woListCursor as the new selection (persisted via
-// AndonWorkOrders::select(), survives reboot), pulls that WO's real target
-// into g_andon, then proceeds straight into the counter screen (matches
-// the old direct-tap entry behavior).
+// AndonWorkOrders::select(), survives reboot), pulls that WO's real
+// target AND its own last-known production count into g_andon, then
+// proceeds straight into the counter screen (matches the old direct-tap
+// entry behavior).
+//
+// The productionCount line fixes a reported bug (2026-08-13, "pindah2 wo
+// list angkanya ttp sama yang terakhir di input"): g_andon.productionCount
+// used to just carry over whatever it already was across a WO switch (a
+// single value shared by every work order), so switching from WO A (just
+// updated to 50) to WO B showed 50 too, instead of B's own count -
+// AndonWorkOrders::productionCount() now gives each WO its own value.
 static void onWorkOrderSelect(lv_event_t *e) {
   if (AndonWorkOrders::count() <= 0) return;
   AndonWorkOrders::select(g_woListCursor);
   g_andon.workOrderId = AndonWorkOrders::workOrderId(g_woListCursor);
   g_andon.productionTarget = AndonWorkOrders::target(g_woListCursor);
+  g_andon.productionCount = AndonWorkOrders::productionCount(g_woListCursor);
   g_productionEditValue = g_andon.productionCount; // edit a scratch copy so CANCEL can discard it
   showScreenUpdateProduction();
 }
@@ -1851,6 +1865,11 @@ void setup() {
     int idx = AndonWorkOrders::selectedIndex();
     g_andon.workOrderId = AndonWorkOrders::workOrderId(idx);
     g_andon.productionTarget = AndonWorkOrders::target(idx);
+    // That WO's own count, not the struct's default placeholder (72) -
+    // see onWorkOrderSelect()'s comment for the per-WO-count bug this is
+    // also part of fixing (a boot picking up the wrong/stale global count
+    // would be the same symptom one level earlier).
+    g_andon.productionCount = AndonWorkOrders::productionCount(idx);
   }
   // SCR-01 already rendered above with the pre-sync placeholder ("WO-240811-07")
   // - rebuild it now that the real work order (fetched or restored) is known.

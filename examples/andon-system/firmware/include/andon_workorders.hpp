@@ -47,4 +47,23 @@ int selectedIndex();
 // row in main.cpp's SCR_WORK_ORDER_LIST.
 void select(int idx);
 
+// Each work order's OWN last-known production count, persisted (NVS,
+// keyed by that work order's id, not by list index - so it survives the
+// list being re-fetched/reordered) and restored by sync(). Fixes a bug
+// (2026-08-13, "pindah2 wo list angkanya ttp sama yang terakhir di
+// input") where main.cpp's g_andon.productionCount was a single value
+// shared across every work order - switching from WO A (just updated to
+// 50) to WO B carried A's 50 into B's counter instead of showing B's own
+// count. Device-local only (not fetched from the backend's per-WO
+// production store - see backend/src/production-store.ts - so two
+// different terminals working the same work order can still diverge
+// locally; same "not operator-owned truth" caveat main.cpp's
+// AndonState::productionCount already carried before this existed).
+int productionCount(int idx);
+
+// Updates idx's count in memory and NVS - call from main.cpp's
+// onProductionConfirm() alongside (not instead of) the existing
+// AndonMqtt::submitProductionUpdate() call.
+void setProductionCount(int idx, int count);
+
 } // namespace AndonWorkOrders
