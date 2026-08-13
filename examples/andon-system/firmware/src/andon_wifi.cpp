@@ -149,33 +149,51 @@ bool AndonWifi::connectSavedOrFallback(lv_obj_t *statusLabel) {
 // Row breaks are literal "\n" array entries (lv_btnmatrix convention); a
 // "\n" INSIDE a cell's own string (e.g. "j\nk") instead makes a 2-line
 // label on that one button - LVGL draws it centered, stacked.
+//
+// Back/Tab used to be a separate 36px-tall button row sitting above the
+// keyboard (see git log on this branch) - folded into the keyboard's own
+// row 4 instead (2026-08-13, "coba di optimise lagi... buat btn agak
+// gede") so the whole grid can start right at the y=113 dead-zone line
+// instead of 42px lower, reclaiming that height for rows 1-3 (the actual
+// typing surface) via applyKbMap()'s width weighting below. The tab
+// button's label can't dynamically say "Server >"/"< WiFi" anymore like
+// the old separate lv_btn did (btnmatrix cells only carry static text from
+// the map) - s_pwTitle already names the active field ("Password for: X"
+// vs "Backend server IP/domain"), so this button just uses a fixed swap
+// glyph instead of losing that information, not duplicating it.
 static const char *wifiKbMapLower[] = {
   "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "\n",
   "a", "s", "d", "f", "g", "h", "j\nk", "l", "\n",
   LV_SYMBOL_UP, "z\nx\nv", "c", "b", "n", "m", LV_SYMBOL_BACKSPACE, "\n",
-  "123", "SPACE", LV_SYMBOL_OK, "",
+  LV_SYMBOL_LEFT " Back", "123", "SPACE", LV_SYMBOL_OK, LV_SYMBOL_LOOP " Srv", "",
 };
 static const char *wifiKbMapUpper[] = {
   "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "\n",
   "A", "S", "D", "F", "G", "H", "J\nK", "L", "\n",
   LV_SYMBOL_UP, "Z\nX\nV", "C", "B", "N", "M", LV_SYMBOL_BACKSPACE, "\n",
-  "123", "SPACE", LV_SYMBOL_OK, "",
+  LV_SYMBOL_LEFT " Back", "123", "SPACE", LV_SYMBOL_OK, LV_SYMBOL_LOOP " Srv", "",
 };
 // Index -> the actual character(s) that cell cycles through (case-folded;
 // shift uppercases at insert time, same as the old T9 code did - see
-// onPwKeypad()). NULL entries are control cells (Shift/Backspace/123/
-// Space/Send), handled by index instead of a cycle lookup.
+// onPwKeypad()). NULL entries are control cells (Shift/Backspace/Back/123/
+// Space/Send/Tab), handled by index instead of a cycle lookup.
 static const char *wifiKbCycleLower[] = {
   "q", "w", "e", "r", "t", "y", "u", "i", "o", "p",              // 0-9
   "a", "s", "d", "f", "g", "h", "jk", "l",                       // 10-17
   NULL, "zxv", "c", "b", "n", "m", NULL,                         // 18-24 (18=Shift, 24=Backspace)
-  NULL, NULL, NULL,                                              // 25-27 (123, Space, Send)
+  NULL, NULL, NULL, NULL, NULL,                                  // 25-29 (Back, 123, Space, Send, Tab)
 };
 static const int KB_SHIFT_IDX = 18;
 static const int KB_LETTER_BACKSPACE_IDX = 24;
-static const int KB_MODE_IDX = 25;
-static const int KB_SPACE_IDX = 26;
-static const int KB_SEND_IDX = 27;
+static const int KB_BACK_IDX = 25;
+static const int KB_MODE_IDX = 26;
+static const int KB_SPACE_IDX = 27;
+static const int KB_SEND_IDX = 28;
+static const int KB_TAB_IDX = 29;
+// Row 4's relative width units (see applyKbMap()'s lv_btnmatrix_set_btn_
+// width() calls) - Space and Send are what actually get tapped often;
+// Back/123/Tab are occasional, so they can stay narrower.
+static const uint8_t KB_ROW4_WIDTHS[] = {1, 1, 2, 2, 1}; // Back,123,Space,Send,Tab
 
 // --- Number/symbol mode ------------------------------------------------------
 // No grouping here - digits and the symbols routers actually put in
@@ -183,12 +201,14 @@ static const int KB_SEND_IDX = 27;
 static const char *wifiKbMapNumber[] = {
   "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "\n",
   "@", "#", "$", "%", "^", "&", "*", "-", "_", ".", LV_SYMBOL_BACKSPACE, "\n",
-  "ABC", "SPACE", LV_SYMBOL_OK, "",
+  LV_SYMBOL_LEFT " Back", "ABC", "SPACE", LV_SYMBOL_OK, LV_SYMBOL_LOOP " Srv", "",
 };
 static const int KB_NUMBER_BACKSPACE_IDX = 20;
-static const int KB_NUMBER_ABC_IDX = 21;
-static const int KB_NUMBER_SPACE_IDX = 22;
-static const int KB_NUMBER_SEND_IDX = 23;
+static const int KB_NUMBER_BACK_IDX = 21;
+static const int KB_NUMBER_ABC_IDX = 22;
+static const int KB_NUMBER_SPACE_IDX = 23;
+static const int KB_NUMBER_SEND_IDX = 24;
+static const int KB_NUMBER_TAB_IDX = 25;
 
 enum KbMode { KB_MODE_LOWER, KB_MODE_UPPER, KB_MODE_NUMBER };
 static KbMode s_kbMode = KB_MODE_LOWER;
@@ -220,13 +240,15 @@ static String s_setupSsid = "";
 
 // "Server" tab - same screen, same keyboard, different target textarea.
 // s_activeTa is whichever of s_pwTa/s_serverTa the keyboard is currently
-// writing into; kept as its own pointer (updated by onTabToggle() and
-// showPasswordView()) so onPwKeypad() doesn't need to know about tabs at
-// all beyond which save/connect action Send should trigger.
+// writing into; kept as its own pointer (updated by the Tab cell in
+// onPwKeypad() and showPasswordView()) so most of this file doesn't need
+// to know about tabs at all beyond which save/connect action Send should
+// trigger. No dedicated lv_btn widgets for Back/Tab anymore - both are
+// now cells inside s_pwKb's own control row (see the keyboard map comment
+// block above) - so there's nothing to hide/show for them beyond the
+// keyboard itself.
 static bool s_onServerTab = false;
 static lv_obj_t *s_serverTa = nullptr;
-static lv_obj_t *s_tabBtn = nullptr;
-static lv_obj_t *s_pwBackBtn = nullptr;
 static lv_obj_t *s_activeTa = nullptr;
 
 static bool s_setupRequested = false;
@@ -282,15 +304,13 @@ static void showListView() {
   lv_obj_add_flag(s_pwTa, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_serverTa, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_pwStatusLabel, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(s_tabBtn, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(s_pwBackBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_pwKb, LV_OBJ_FLAG_HIDDEN);
 }
 
-// Shows whichever of s_pwTa/s_serverTa matches s_onServerTab, updates the
-// title and the tab button's own label to name the OTHER tab (what tapping
-// it switches to), and points s_activeTa at the now-visible field so
-// onPwKeypad() doesn't need to know about tabs at all.
+// Shows whichever of s_pwTa/s_serverTa matches s_onServerTab and updates
+// the title to name it - points s_activeTa at the now-visible field so
+// onPwKeypad() doesn't need to know about tabs at all beyond which save/
+// connect action Send should trigger.
 static void applyTabVisibility() {
   if (s_onServerTab) {
     lv_label_set_text(s_pwTitle, "Backend server IP/domain");
@@ -305,17 +325,13 @@ static void applyTabVisibility() {
   }
 }
 
-static void onTabToggle(lv_event_t *e) {
+// Tapped from onPwKeypad()'s KB_TAB_IDX/KB_NUMBER_TAB_IDX cell (was a
+// separate lv_btn's onTabToggle() click handler before the Back/Tab row
+// got folded into the keyboard - see the map comment block above).
+static void toggleServerTab() {
   s_onServerTab = !s_onServerTab;
   lv_label_set_text(s_pwStatusLabel, "");
-  if (s_onServerTab) {
-    lv_textarea_set_text(s_serverTa, AndonWifi::getServerHost().c_str());
-    lv_obj_t *tabLabel = lv_obj_get_child(s_tabBtn, 0);
-    lv_label_set_text(tabLabel, LV_SYMBOL_LEFT "\nWiFi");
-  } else {
-    lv_obj_t *tabLabel = lv_obj_get_child(s_tabBtn, 0);
-    lv_label_set_text(tabLabel, "Server\n" LV_SYMBOL_RIGHT);
-  }
+  if (s_onServerTab) lv_textarea_set_text(s_serverTa, AndonWifi::getServerHost().c_str());
   applyTabVisibility();
 }
 
@@ -326,8 +342,6 @@ static void showPasswordView(const String &ssid) {
   applyKbMap();
   lv_textarea_set_text(s_pwTa, "");
   lv_label_set_text(s_pwStatusLabel, "");
-  lv_obj_t *tabLabel = lv_obj_get_child(s_tabBtn, 0);
-  lv_label_set_text(tabLabel, "Server\n" LV_SYMBOL_RIGHT);
   applyTabVisibility(); // sets s_pwTitle text too, so no separate title line needed here
 
   // s_listTitle and s_pwTitle both sit at the same TOP_MID/y=8 spot (see
@@ -343,12 +357,8 @@ static void showPasswordView(const String &ssid) {
   lv_obj_add_flag(s_skipBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_pwTitle, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_pwStatusLabel, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_clear_flag(s_tabBtn, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_clear_flag(s_pwBackBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_pwKb, LV_OBJ_FLAG_HIDDEN);
 }
-
-static void onBackToList(lv_event_t *e) { showListView(); }
 
 // Send (WiFi tab) / Save (Server tab) - shared by both letter mode's
 // KB_SEND_IDX and number mode's KB_NUMBER_SEND_IDX (see onPwKeypad()).
@@ -385,6 +395,17 @@ static void applyKbMap() {
                     : wifiKbMapLower;
   lv_btnmatrix_set_map(s_pwKb, map);
   s_cycleLastIdx = -1;
+
+  // Give Space/Send extra relative width within the control row - see
+  // KB_ROW4_WIDTHS's comment. Both letter modes and number mode happen to
+  // lay their control row out in the same Back/mode-toggle/Space/Send/Tab
+  // order, just at different starting indices. lv_btnmatrix_set_map()
+  // resets every button to width 1, so this has to run after it every
+  // time, not just once at creation.
+  int controlRowStart = (s_kbMode == KB_MODE_NUMBER) ? KB_NUMBER_BACK_IDX : KB_BACK_IDX;
+  for (int i = 0; i < 5; i++) {
+    lv_btnmatrix_set_btn_width(s_pwKb, controlRowStart + i, KB_ROW4_WIDTHS[i]);
+  }
 }
 
 static void onPwKeypad(lv_event_t *e) {
@@ -395,9 +416,11 @@ static void onPwKeypad(lv_event_t *e) {
 
   if (s_kbMode == KB_MODE_NUMBER) {
     if (idx == KB_NUMBER_BACKSPACE_IDX) { lv_textarea_del_char(s_activeTa); return; }
+    if (idx == KB_NUMBER_BACK_IDX) { showListView(); return; }
     if (idx == KB_NUMBER_ABC_IDX) { s_kbMode = KB_MODE_LOWER; applyKbMap(); return; }
     if (idx == KB_NUMBER_SPACE_IDX) { lv_textarea_add_char(s_activeTa, ' '); return; }
     if (idx == KB_NUMBER_SEND_IDX) { triggerSendOrSave(); return; }
+    if (idx == KB_NUMBER_TAB_IDX) { toggleServerTab(); return; }
     // Every other cell in number mode is a direct single-char insert - no
     // cycling, see the "no grouping here" comment on wifiKbMapNumber.
     const char *txt = lv_btnmatrix_get_btn_text(btnm, idx);
@@ -416,6 +439,7 @@ static void onPwKeypad(lv_event_t *e) {
     s_cycleLastIdx = -1;
     return;
   }
+  if (idx == KB_BACK_IDX) { showListView(); return; }
   if (idx == KB_MODE_IDX) {
     s_kbMode = KB_MODE_NUMBER;
     applyKbMap();
@@ -428,6 +452,10 @@ static void onPwKeypad(lv_event_t *e) {
   }
   if (idx == KB_SEND_IDX) {
     triggerSendOrSave();
+    return;
+  }
+  if (idx == KB_TAB_IDX) {
+    toggleServerTab();
     return;
   }
 
@@ -678,55 +706,26 @@ static void createSetupScreen() {
   lv_obj_set_style_text_color(s_pwStatusLabel, lv_color_hex(0xffffff), 0);
   lv_obj_align(s_pwStatusLabel, LV_ALIGN_TOP_MID, 0, 80);
 
-  // Two small buttons side by side (was a 3-stacked column: Symbols/Back/
-  // Tab) - the custom keyboard's own 123/Send cells (and Shift for case)
-  // cover what Symbols used to, so only Back and the WiFi<->Server tab
-  // switch still need dedicated widgets. Both sit in the same y=113
-  // dead-zone-safe row as the keyboard's row 1 starts just below them -
-  // freeing the rest of that column's width is the actual point of this
-  // experiment, not just fitting one more button.
-  const int32_t PW_BTN_W = 70, PW_BTN_H = 36;
-  s_pwBackBtn = lv_btn_create(lv_scr_act());
-  lv_obj_set_size(s_pwBackBtn, PW_BTN_W, PW_BTN_H);
-  lv_obj_align(s_pwBackBtn, LV_ALIGN_TOP_RIGHT, -86, 113);
-  lv_obj_add_event_cb(s_pwBackBtn, onBackToList, LV_EVENT_CLICKED, NULL);
-  lv_obj_set_style_radius(s_pwBackBtn, 12, 0);
-  lv_obj_set_style_bg_color(s_pwBackBtn, lv_color_hex(0x1e293b), 0);
-  lv_obj_set_style_border_width(s_pwBackBtn, 1, 0);
-  lv_obj_set_style_border_color(s_pwBackBtn, lv_color_hex(0x22c55e), 0);
-  lv_obj_t *backLabel = lv_label_create(s_pwBackBtn);
-  lv_label_set_text(backLabel, LV_SYMBOL_LEFT " Back");
-  lv_obj_set_style_text_font(backLabel, &lv_font_montserrat_12, 0);
-  lv_obj_center(backLabel);
-
-  s_tabBtn = lv_btn_create(lv_scr_act());
-  lv_obj_set_size(s_tabBtn, PW_BTN_W, PW_BTN_H);
-  lv_obj_align(s_tabBtn, LV_ALIGN_TOP_RIGHT, -10, 113);
-  lv_obj_add_event_cb(s_tabBtn, onTabToggle, LV_EVENT_CLICKED, NULL);
-  lv_obj_set_style_radius(s_tabBtn, 12, 0);
-  lv_obj_set_style_bg_color(s_tabBtn, lv_color_hex(0x1e293b), 0);
-  lv_obj_set_style_border_width(s_tabBtn, 1, 0);
-  lv_obj_set_style_border_color(s_tabBtn, lv_color_hex(0x22c55e), 0);
-  lv_obj_t *tabLabel = lv_label_create(s_tabBtn);
-  lv_label_set_text(tabLabel, "Server\n" LV_SYMBOL_RIGHT);
-  lv_obj_set_style_text_font(tabLabel, &lv_font_montserrat_12, 0);
-  lv_obj_set_style_text_align(tabLabel, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_center(tabLabel);
-
-  // Custom big-key keyboard - nearly full content width (460 of 480),
-  // starting right below the Back/Tab row (both start at the same y=113
-  // dead-zone-safe line - see the CONTENT_W/MARGIN/GAP comment convention
-  // this firmware otherwise uses in main.cpp). See the keyboard comment
-  // block near the top of this file for the row/grouping design and
-  // applyKbMap() for how s_kbMode picks which of the three maps is active.
+  // Custom big-key keyboard - Back/Tab folded into its own row 4 now (see
+  // the map comment block above), so there's no separate button row above
+  // it anymore; the whole grid starts right at y=113, the dead-zone-safe
+  // line (see the CONTENT_W/MARGIN/GAP comment convention this firmware
+  // otherwise uses in main.cpp) and runs almost to the bottom edge -
+  // 468x203 vs the first cut's 460x160, reclaiming the ~42px a separate
+  // button row used to cost plus a few px of side margin. Tighter
+  // pad_all/pad_row/pad_column too (was 4/6/6) - less dead space between
+  // cells means more of it goes to the cells themselves. Together this is
+  // the actual "biar mudah diklik" follow-up request answered two ways:
+  // fewer/bigger cells (the row-merging in the map itself) AND less
+  // wasted layout space around them.
   s_pwKb = lv_btnmatrix_create(lv_scr_act());
   applyKbMap();
   lv_obj_add_event_cb(s_pwKb, onPwKeypad, LV_EVENT_VALUE_CHANGED, NULL);
   lv_obj_set_style_bg_opa(s_pwKb, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(s_pwKb, 0, 0);
-  lv_obj_set_style_pad_all(s_pwKb, 4, 0);
-  lv_obj_set_style_pad_row(s_pwKb, 6, 0);
-  lv_obj_set_style_pad_column(s_pwKb, 6, 0);
+  lv_obj_set_style_pad_all(s_pwKb, 2, 0);
+  lv_obj_set_style_pad_row(s_pwKb, 4, 0);
+  lv_obj_set_style_pad_column(s_pwKb, 4, 0);
   lv_obj_set_style_radius(s_pwKb, 8, LV_PART_ITEMS);
   lv_obj_set_style_bg_color(s_pwKb, lv_color_hex(0x1e293b), LV_PART_ITEMS);
   lv_obj_set_style_border_width(s_pwKb, 1, LV_PART_ITEMS);
@@ -734,8 +733,8 @@ static void createSetupScreen() {
   lv_obj_set_style_text_color(s_pwKb, lv_color_hex(0xffffff), LV_PART_ITEMS);
   lv_obj_set_style_bg_color(s_pwKb, lv_color_hex(0x22c55e), LV_PART_ITEMS | LV_STATE_CHECKED);
   lv_obj_set_style_text_color(s_pwKb, lv_color_hex(0x0f172a), LV_PART_ITEMS | LV_STATE_CHECKED);
-  lv_obj_set_size(s_pwKb, 460, 160);
-  lv_obj_align(s_pwKb, LV_ALIGN_TOP_LEFT, 10, 155);
+  lv_obj_set_size(s_pwKb, 468, 203);
+  lv_obj_align(s_pwKb, LV_ALIGN_TOP_LEFT, 6, 113);
 
   showListView(); // start on the list view
 
