@@ -4,6 +4,8 @@
 
 **Same-day product decision, applied after the above:** Start Handling and Resolve are no longer dashboard actions at all - only Acknowledge is. A technician must be physically at the terminal to advance past Acknowledged; the backend doesn't expose `.../start-handling` or `.../resolve` REST endpoints anymore (removed, not just hidden - agents.md §11: "hiding a button is not authorization"). Firmware now drives those two transitions itself over MQTT (`AndonMqtt::submitStatusUpdate()`, closing §8's old "known gap" below - firmware really does subscribe now, and the old `(DEMO) SIMULATE TECHNICIAN ACK` button is gone). §2/§4/§4.1/§8 below still describe the original all-three-actions design; treat this note as the current behavior where they conflict.
 
+**Also added same day:** `production_updated` now carries `workOrderId` alongside `productionCount` (device-selected via the new `SCR_WORK_ORDER_LIST` picker - see `firmware/PLAN.md` §10 and `architectur.md` §8.1), shown under the station name on each production tile (`render.ts`'s `renderProductionTiles()`). `GET /api/v1/production`'s response shape changed from `Record<string, number>` to `Record<string, {productionCount, workOrderId}>` to carry it - both `api.ts` and `main.ts` updated to match. The device also now pushes a `production_updated` once automatically on every boot, not only on an operator's manual confirm, so a tile won't look stale right after a terminal power-cycles.
+
 | Field | Value |
 |---|---|
 | Scope | `examples/andon-system/dashboard/` (new) + a small, explicit extension to `backend/` — the current backend can't back an interactive dashboard as-is (see §2) |

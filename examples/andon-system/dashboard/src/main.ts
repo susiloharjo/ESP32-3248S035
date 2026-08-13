@@ -1,5 +1,5 @@
 import "./style.css";
-import type { Incident } from "./types";
+import type { Incident, ProductionEntry } from "./types";
 import { fetchIncidents, fetchProduction, acknowledgeIncident } from "./api";
 import { connectRealtime } from "./realtime";
 import { renderActiveBoard, renderResolvedList, renderProductionTiles, renderConnectionStatus, showAlert, tickAges } from "./render";
@@ -15,7 +15,7 @@ const connectionEl = document.querySelector<HTMLElement>("#connection-status")!;
 // all funnel through upsertIncident() so there's one place that decides
 // when to re-render.
 const incidents = new Map<string, Incident>();
-let production: Record<string, number> = {};
+let production: Record<string, ProductionEntry> = {};
 
 function renderAll(): void {
   const list = [...incidents.values()];
@@ -52,7 +52,10 @@ connectRealtime(
         upsertIncident(event.incident);
         break;
       case "production_updated":
-        production = { ...production, [event.stationId]: event.productionCount };
+        production = {
+          ...production,
+          [event.stationId]: { productionCount: event.productionCount, workOrderId: event.workOrderId },
+        };
         renderProductionTiles(productionEl, production);
         break;
     }

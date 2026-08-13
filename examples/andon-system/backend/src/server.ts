@@ -38,6 +38,7 @@ import type { AedesPublishPacket, Client } from "aedes";
 import { STATION_CONFIG } from "./config-data";
 import { createOrGetIncident, listIncidents, acknowledgeIncident, startHandlingIncident, resolveIncident } from "./incident-store";
 import { setProductionCount, listProductionCounts } from "./production-store";
+import { listWorkOrders } from "./work-order-store";
 import { registerClient, broadcast } from "./realtime";
 
 const HTTP_PORT = Number(process.env.HTTP_PORT ?? 8080);
@@ -147,9 +148,10 @@ broker.on("publish", (packet: AedesPublishPacket, client: Client | null) => {
     // acknowledge/resolve/etc lifecycle), so it's acked directly rather
     // than routed through the incident store.
     const count = evt.payload.productionCount as number;
-    setProductionCount(evt.stationId, count);
-    broadcast({ type: "production_updated", stationId: evt.stationId, productionCount: count });
-    app.log.info({ stationId: evt.stationId, productionCount: count }, "Production count updated");
+    const workOrderId = (evt.payload.workOrderId as string) ?? "";
+    setProductionCount(evt.stationId, count, workOrderId);
+    broadcast({ type: "production_updated", stationId: evt.stationId, productionCount: count, workOrderId });
+    app.log.info({ stationId: evt.stationId, productionCount: count, workOrderId }, "Production count updated");
     publishResult(evt.deviceId, evt.correlationId, "n/a");
     return;
   }
@@ -233,6 +235,17 @@ app.get<{ Params: { stationId: string } }>(
     // Real backend would 404 for an unknown stationId (architectur.md's
     // stations table) - this test backend serves the same seed for any id.
     return { ...STATION_CONFIG, stationId: request.params.stationId };
+  },
+);
+
+// New (2026-08-13), not in architectur.md/contracts/ yet - same ad-hoc-
+// extension status as PRODUCTION_COUNT_UPDATED above (see work-order-
+// store.ts's header). Lets the device's WORK ORDER picker (SCR_WORK_ORDER_LIST
+// in firmware/src/main.cpp) show something real instead of a hardcoded id.
+app.get<{ Params: { stationId: string } }>(
+  "/api/v1/work-orders/stations/:stationId",
+  async (request) => {
+    return { workOrders: listWorkOrders(request.params.stationId) };
   },
 );
 

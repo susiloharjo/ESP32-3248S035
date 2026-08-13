@@ -4,7 +4,7 @@
 // its contents - cheap enough at this scale (a handful of incidents) that
 // there's no need for a diffing layer.
 
-import type { Incident } from "./types";
+import type { Incident, ProductionEntry } from "./types";
 import { CATEGORY_COLORS, STATUS_COLORS } from "./tokens";
 
 function formatAge(openedAt: string): string {
@@ -94,17 +94,18 @@ export function renderResolvedList(container: HTMLElement, incidents: Incident[]
     : `<li class="empty-state">Nothing resolved yet.</li>`;
 }
 
-export function renderProductionTiles(container: HTMLElement, production: Record<string, number>): void {
+export function renderProductionTiles(container: HTMLElement, production: Record<string, ProductionEntry>): void {
   const stations = Object.keys(production).sort();
   container.innerHTML = stations.length
     ? stations
-        .map(
-          (stationId) => `
+        .map((stationId) => {
+          const entry = production[stationId];
+          return `
       <div class="production-tile">
-        <div class="tile-station">${stationId}</div>
-        <div class="tile-count">${production[stationId]}</div>
-      </div>`,
-        )
+        <div class="tile-station">${stationId}<span class="tile-wo">${entry.workOrderId || "—"}</span></div>
+        <div class="tile-count">${entry.productionCount}</div>
+      </div>`;
+        })
         .join("")
     : `<p class="empty-state">No production data yet.</p>`;
 }

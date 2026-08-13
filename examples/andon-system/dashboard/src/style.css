@@ -168,6 +168,18 @@ section h2 {
 .tile-station {
   font-size: 13px;
   color: var(--text-secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Work order the tile's count was last reported against - see
+   render.ts's renderProductionTiles(). */
+.tile-wo {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  opacity: 0.75;
 }
 
 .tile-count {

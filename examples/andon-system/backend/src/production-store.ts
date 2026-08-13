@@ -4,13 +4,24 @@
 // this just replaces the old bare latestProductionCountByStation Map with a
 // couple of named accessors so dashboard/PLAN.md's GET /api/v1/production
 // has something to read from.
+//
+// Also carries the workOrderId the count was last reported against
+// (2026-08-13, alongside firmware/src/andon_workorders.cpp) - purely
+// informational for the dashboard tile, not a validation/authority check;
+// the device is free to report against whatever work order it currently
+// has selected.
 
-const productionByStation = new Map<string, number>();
-
-export function setProductionCount(stationId: string, count: number): void {
-  productionByStation.set(stationId, count);
+export interface ProductionEntry {
+  productionCount: number;
+  workOrderId: string;
 }
 
-export function listProductionCounts(): Record<string, number> {
+const productionByStation = new Map<string, ProductionEntry>();
+
+export function setProductionCount(stationId: string, count: number, workOrderId: string): void {
+  productionByStation.set(stationId, { productionCount: count, workOrderId });
+}
+
+export function listProductionCounts(): Record<string, ProductionEntry> {
   return Object.fromEntries(productionByStation);
 }

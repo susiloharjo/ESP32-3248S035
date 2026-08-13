@@ -20,7 +20,12 @@ export interface Incident {
   resolvedAt?: string;
 }
 
+export interface ProductionEntry {
+  productionCount: number;
+  workOrderId: string;
+}
+
 export type DashboardEvent =
   | { type: "incident_created"; incident: Incident }
   | { type: "incident_updated"; incident: Incident }
-  | { type: "production_updated"; stationId: string; productionCount: number };
+  | { type: "production_updated"; stationId: string; productionCount: number; workOrderId: string };

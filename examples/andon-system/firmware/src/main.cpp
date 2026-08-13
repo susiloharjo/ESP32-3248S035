@@ -14,6 +14,7 @@
 #include <time.h> // struct tm/getLocalTime/strftime - NTP header clock, see tickTimerCb()
 
 #include "andon_config.hpp" // reason-list sync from the backend - see setup(), andon_config.cpp
+#include "andon_workorders.hpp" // work-order list sync/selection - see setup(), showScreenWorkOrderList()
 #include "andon_wifi.hpp" // on-device WiFi setup screen - see onOpenConfig(), loop()
 #include "andon_mqtt.hpp" // Send Request submission - see submitRequest()
 
@@ -613,10 +614,14 @@ enum AndonScreenId {
   SCR_ACKNOWLEDGED, // covers both "on the way" and "handling" sub-states
   SCR_RESOLVED,
   SCR_UPDATE_PRODUCTION, // operator-facing counter to log pipes completed
+  SCR_WORK_ORDER_LIST,   // picker reached from SCR-01's UPDATE PRODUCTION button - see andon_workorders.hpp
 };
 
-// Work order target stays fixed - only the completed count is editable from
-// the terminal (see showScreenUpdateProduction()).
+// Fallback target used only before AndonWorkOrders::sync() has ever
+// resolved a real one (first boot, no cache, no network) - matches
+// andon_workorders.cpp's applyPlaceholder(). Once a work order is fetched
+// or selected, g_andon.productionTarget carries that WO's real target
+// instead (see onWorkOrderTap()).
 #define PRODUCTION_TARGET 120
 
 struct AndonState {
@@ -629,6 +634,13 @@ struct AndonState {
   bool mockConnected = true; // dev-toggleable fake connectivity (long-press header)
   int productionCount = 72;  // TODO(backend): synced from the line, not operator-owned truth
   String incidentId = "";    // backend-assigned - set once AndonMqtt::submitAndonRequest() actually returns ACCEPTED (see submitRequest()); empty while queued/offline
+  // Work order the operator is currently producing against - restored/
+  // fetched by AndonWorkOrders::sync() in setup(), changeable via
+  // SCR_WORK_ORDER_LIST (see onWorkOrderTap()). Defaults match the single
+  // hardcoded placeholder this firmware used before that module existed,
+  // so the terminal is still demoable before sync() ever runs.
+  String workOrderId = "WO-240811-07";
+  int productionTarget = PRODUCTION_TARGET;
 };
 static AndonState g_andon;
 
@@ -672,6 +684,7 @@ static void showScreenQueuedOffline();
 static void showScreenAcknowledged();
 static void showScreenResolved();
 static void showScreenUpdateProduction();
+static void showScreenWorkOrderList();
 static void updateHeaderConnDot();
 
 //------------------------------------------------------------------------------
@@ -1050,10 +1063,27 @@ static void showConfirmDialog(const char *title, const char *message,
 //------------------------------------------------------------------------------
 static void onNeedAssistance(lv_event_t *e) { showScreenCategory(); }
 
+// Now opens the work-order picker first (SCR_WORK_ORDER_LIST) instead of
+// going straight to the counter - operator picks which WO they're
+// producing against, then updates the count for it (see onWorkOrderTap()).
 static void onOpenUpdateProduction(lv_event_t *e) {
+  showScreenWorkOrderList();
+}
+
+// Tapped from SCR_WORK_ORDER_LIST - commits the selection (persisted via
+// AndonWorkOrders::select(), survives reboot), pulls that WO's real target
+// into g_andon, then proceeds straight into the counter screen (matches
+// the old onOpenUpdateProduction() entry behavior).
+static void onWorkOrderTap(lv_event_t *e) {
+  intptr_t idx = (intptr_t)lv_event_get_user_data(e);
+  AndonWorkOrders::select((int)idx);
+  g_andon.workOrderId = AndonWorkOrders::workOrderId((int)idx);
+  g_andon.productionTarget = AndonWorkOrders::target((int)idx);
   g_productionEditValue = g_andon.productionCount; // edit a scratch copy so CANCEL can discard it
   showScreenUpdateProduction();
 }
+
+static void onWorkOrderListBack(lv_event_t *e) { showScreenNormal(); }
 
 // Gear button on SCR-01 -> WiFi setup, ported from examples/gemini-chatbot
 // (see andon_wifi.hpp/.cpp). Only SETS a flag here rather than calling
@@ -1097,8 +1127,9 @@ static void onProductionCancel(lv_event_t *e) { showScreenNormal(); } // discard
 // during the blocking wait" note).
 static void onProductionConfirm(lv_event_t *e) {
   g_andon.productionCount = g_productionEditValue;
-  bool acked = AndonMqtt::submitProductionUpdate(g_andon.productionCount, "WO-240811-07");
-  Serial.printf("[production] count=%d backend_acked=%d\r\n", g_andon.productionCount, acked);
+  bool acked = AndonMqtt::submitProductionUpdate(g_andon.productionCount, g_andon.workOrderId.c_str());
+  Serial.printf("[production] count=%d wo=%s backend_acked=%d\r\n",
+                g_andon.productionCount, g_andon.workOrderId.c_str(), acked);
   showScreenNormal();
 }
 static void onCategoryCancel(lv_event_t *e) { showScreenNormal(); }
@@ -1132,7 +1163,7 @@ static void submitRequest() {
   const CategoryInfo &cat = CATEGORIES[g_andon.categoryIdx];
   const char *reasonCode = cat.reasonCodes[g_andon.reasonIdx];
   String incidentId;
-  bool accepted = AndonMqtt::submitAndonRequest(cat.label, reasonCode, "WO-240811-07", incidentId);
+  bool accepted = AndonMqtt::submitAndonRequest(cat.label, reasonCode, g_andon.workOrderId.c_str(), incidentId);
 
   if (accepted) {
     g_andon.incidentId = incidentId;
@@ -1154,14 +1185,19 @@ static void onReasonSend(lv_event_t *e) {
 
 // TODO(backend): replace with MQTT publish to andon/v1/.../cancel
 static void cancelRequest() {
-  // Only the incident-flow fields reset here - connectivity and the
-  // production tally aren't part of the incident, so both would otherwise
-  // silently snap back to their defaults on every cancel.
+  // Only the incident-flow fields reset here - connectivity, the
+  // production tally, and the selected work order aren't part of the
+  // incident, so all three would otherwise silently snap back to their
+  // defaults on every cancel.
   bool wasConnected = g_andon.mockConnected;
   int production = g_andon.productionCount;
+  String workOrderId = g_andon.workOrderId;
+  int productionTarget = g_andon.productionTarget;
   g_andon = AndonState();
   g_andon.mockConnected = wasConnected;
   g_andon.productionCount = production;
+  g_andon.workOrderId = workOrderId;
+  g_andon.productionTarget = productionTarget;
   showScreenNormal();
 }
 
@@ -1229,9 +1265,13 @@ static void closeSuccessTimerCb(lv_timer_t *timer) {
 static void onConfirmRun(lv_event_t *e) {
   bool wasConnected = g_andon.mockConnected;
   int production = g_andon.productionCount;
+  String workOrderId = g_andon.workOrderId;
+  int productionTarget = g_andon.productionTarget;
   g_andon = AndonState();
   g_andon.mockConnected = wasConnected;
   g_andon.productionCount = production;
+  g_andon.workOrderId = workOrderId;
+  g_andon.productionTarget = productionTarget;
 
   // design.md SS7 SCR-06: "show a two-second success state, then return to
   // SCR-01" - not a real screen enum, just a transient checkmark.
@@ -1265,9 +1305,9 @@ static void showScreenNormal() {
 
   // One card, 3 columns (was 3 separate boxes) - matches the reference layout.
   char productionText[16];
-  snprintf(productionText, sizeof(productionText), "%d / %d", g_andon.productionCount, PRODUCTION_TARGET);
+  snprintf(productionText, sizeof(productionText), "%d / %d", g_andon.productionCount, g_andon.productionTarget);
   makeMetricCard3(g_content, MARGIN, 78, CONTENT_W - 2 * MARGIN, 124,
-                   LV_SYMBOL_LIST, "WORK ORDER", "WO-240811-07",
+                   LV_SYMBOL_LIST, "WORK ORDER", g_andon.workOrderId.c_str(),
                    LV_SYMBOL_DRIVE, "PRODUCTION", productionText,
                    LV_SYMBOL_CHARGE, "RATE", "18 pcs/h");
 
@@ -1314,8 +1354,9 @@ static void showScreenUpdateProduction() {
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
 
   lv_obj_t *subtitle = lv_label_create(g_content);
-  char subtitleText[32];
-  snprintf(subtitleText, sizeof(subtitleText), "Target: %d pipes", PRODUCTION_TARGET);
+  char subtitleText[48];
+  snprintf(subtitleText, sizeof(subtitleText), "%s - Target: %d pipes",
+           g_andon.workOrderId.c_str(), g_andon.productionTarget);
   lv_label_set_text(subtitle, subtitleText);
   lv_obj_set_style_text_color(subtitle, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
   lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
@@ -1344,6 +1385,58 @@ static void showScreenUpdateProduction() {
              LV_SYMBOL_LEFT "  CANCEL", &lv_font_montserrat_18, onProductionCancel, nullptr);
   makeButton(g_content, MARGIN + halfW + GAP, 210, halfW, 56, COLOR_RUNNING,
              LV_SYMBOL_OK "  CONFIRM", &lv_font_montserrat_18, onProductionConfirm, nullptr);
+}
+
+// Work order picker - reached from SCR-01's UPDATE PRODUCTION button (see
+// onOpenUpdateProduction()). Not one of design.md's numbered screens, same
+// "new scope" status as SCR_UPDATE_PRODUCTION above. List comes from
+// AndonWorkOrders (fetched/cached/placeholder-fallback, see
+// andon_workorders.cpp) - up to 3 rows shown at once, no scrolling
+// (ANDON_WO_MAX is 8; a longer list would need the same up/down paging
+// AndonWifi's screen uses, not built here yet - this station's seed data
+// is only 3). Every row's top edge sits well past the y~113 touch dead
+// zone (see the CONTENT_W/MARGIN/GAP comment block above).
+#define WORK_ORDER_LIST_MAX_ROWS 3
+static void showScreenWorkOrderList() {
+  g_andon.screen = SCR_WORK_ORDER_LIST;
+  clearContent();
+
+  lv_obj_t *title = lv_label_create(g_content);
+  lv_label_set_text(title, "SELECT WORK ORDER");
+  lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT_PRIMARY), 0);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+
+  int n = AndonWorkOrders::count();
+  if (n == 0) {
+    lv_obj_t *empty = lv_label_create(g_content);
+    lv_label_set_text(empty, "No work orders available.");
+    lv_obj_set_style_text_color(empty, lv_color_hex(COLOR_TEXT_SECONDARY), 0);
+    lv_obj_set_style_text_font(empty, &lv_font_montserrat_16, 0);
+    lv_obj_align(empty, LV_ALIGN_TOP_MID, 0, 130);
+  } else {
+    int rows = n < WORK_ORDER_LIST_MAX_ROWS ? n : WORK_ORDER_LIST_MAX_ROWS;
+    const int rowY0 = 44, rowH = 50, rowGap = 6;
+    int selectedIdx = AndonWorkOrders::selectedIndex();
+    for (int i = 0; i < rows; i++) {
+      char rowText[80];
+      snprintf(rowText, sizeof(rowText), "%s %s\n%s - target %d",
+               (i == selectedIdx) ? LV_SYMBOL_OK : " ",
+               AndonWorkOrders::workOrderId(i),
+               AndonWorkOrders::product(i), AndonWorkOrders::target(i));
+      lv_obj_t *row = makeButton(g_content, MARGIN, rowY0 + i * (rowH + rowGap),
+                                  CONTENT_W - 2 * MARGIN, rowH,
+                                  (i == selectedIdx) ? COLOR_RUNNING : COLOR_BG_RAISED,
+                                  rowText, &lv_font_montserrat_14, onWorkOrderTap, (void *)(intptr_t)i);
+      lv_obj_t *label = lv_obj_get_child(row, 0);
+      lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+      lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
+      lv_obj_align(label, LV_ALIGN_LEFT_MID, 8, 0);
+    }
+  }
+
+  makeButton(g_content, MARGIN, 216, CONTENT_W - 2 * MARGIN, 56, COLOR_DISABLED,
+             LV_SYMBOL_LEFT "  BACK", &lv_font_montserrat_18, onWorkOrderListBack, nullptr);
 }
 
 // SCR-02 - Category selection
@@ -1645,6 +1738,38 @@ void setup() {
   // boot, but this must never be called again from inside the UI/timer
   // loop without moving it off the LVGL task first.
   AndonConfig::sync();
+
+  // Same cache/live-refresh/placeholder-fallback contract as
+  // AndonConfig::sync() above (see andon_workorders.cpp) - reuses the WiFi
+  // connection AndonConfig::sync() already brought up, so this doesn't pay
+  // its own ~10s connect timeout on a normal boot. Restores whatever work
+  // order the operator last selected (NVS), or defaults to the first one.
+  AndonWorkOrders::sync();
+  if (AndonWorkOrders::count() > 0) {
+    int idx = AndonWorkOrders::selectedIndex();
+    g_andon.workOrderId = AndonWorkOrders::workOrderId(idx);
+    g_andon.productionTarget = AndonWorkOrders::target(idx);
+  }
+  // SCR-01 already rendered above with the pre-sync placeholder ("WO-240811-07")
+  // - rebuild it now that the real work order (fetched or restored) is known.
+  // Cheap: setup() only runs once, and showScreenNormal() is a normal
+  // screen-swap, not the WiFi flow's special full-screen-wipe case.
+  showScreenNormal();
+
+  // "Push the current production count on every reboot" - so the
+  // dashboard's tile reflects this terminal's count immediately after a
+  // power cycle instead of going stale until the next manual UPDATE
+  // PRODUCTION confirm. Same blocking/bounded-wait contract as every other
+  // AndonMqtt call (acceptable once at boot, see AndonConfig::sync()'s
+  // comment above) - best-effort: if the broker's unreachable this just
+  // logs and moves on, same as every other sync step here.
+  if (WiFi.status() == WL_CONNECTED) {
+    bool acked = AndonMqtt::submitProductionUpdate(g_andon.productionCount, g_andon.workOrderId.c_str());
+    Serial.printf("[boot] production count push count=%d wo=%s backend_acked=%d\r\n",
+                  g_andon.productionCount, g_andon.workOrderId.c_str(), acked);
+  } else {
+    Serial.println("[boot] no WiFi - skipping boot-time production count push");
+  }
 
   g_tickTimer = lv_timer_create(tickTimerCb, 1000, nullptr);
 

@@ -3,7 +3,7 @@
 // the backend so these can stay relative paths in both dev and the built
 // static output served alongside the backend.
 
-import type { Incident } from "./types";
+import type { Incident, ProductionEntry } from "./types";
 
 export async function fetchIncidents(): Promise<Incident[]> {
   const res = await fetch("/api/v1/incidents");
@@ -11,9 +11,9 @@ export async function fetchIncidents(): Promise<Incident[]> {
   return body.incidents;
 }
 
-export async function fetchProduction(): Promise<Record<string, number>> {
+export async function fetchProduction(): Promise<Record<string, ProductionEntry>> {
   const res = await fetch("/api/v1/production");
-  const body = (await res.json()) as { production: Record<string, number> };
+  const body = (await res.json()) as { production: Record<string, ProductionEntry> };
   return body.production;
 }
 
