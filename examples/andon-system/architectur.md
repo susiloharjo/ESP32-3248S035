@@ -208,6 +208,8 @@ Do not place secrets, operator names, or reason text in topic paths.
 
 **Also new (2026-08-13):** `GET /api/v1/work-orders/stations/{stationId}` (HTTP, same pattern as the station-configuration endpoint above, not MQTT) returns `{ "workOrders": [{ "workOrderId", "product", "target", "productionCount" }, ...] }` for that station. Backs the device's new WORK ORDER picker (`main.cpp`'s `SCR_WORK_ORDER_LIST`, reached from SCR-01's UPDATE PRODUCTION button) so `workOrderId` in the payload above is a real operator selection instead of a hardcoded literal. `workOrderId`/`product`/`target` are in-memory seed data only (`backend/src/work-order-store.ts`) - no real ERP/MES integration; `productionCount` is live, joined in at request time from the same per-(station,workOrder) state `PRODUCTION_COUNT_UPDATED` writes to (`production-store.ts`'s `getProductionCount()`) - added same day as a bugfix so the picker always shows the server's own number, not a device-local one that could drift (see `firmware/PLAN.md`'s matching entry). Same "revisit before this leaves test-backend scope" caveat as the extension above; no `contracts/` doc yet either.
 
+**Also new, same day:** `GET /api/v1/work-orders` (no `stationId` - every station's work orders, same `productionCount` enrichment). Fixes a device/dashboard inconsistency: the dashboard's PRODUCTION panel only ever showed work orders that had already reported a count, so a freshly-seeded one the device's picker already listed (with `productionCount: 0`) wasn't on the dashboard yet ("list di hardware dengan list di dashboard beda") - see `dashboard/PLAN.md`'s matching note.
+
 ### 8.2 Event envelope
 
 ```json

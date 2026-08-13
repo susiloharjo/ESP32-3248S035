@@ -1,6 +1,6 @@
 import "./style.css";
 import type { Incident, ProductionEntry } from "./types";
-import { fetchIncidents, fetchProduction, acknowledgeIncident } from "./api";
+import { fetchIncidents, fetchWorkOrderCatalog, acknowledgeIncident } from "./api";
 import { connectRealtime } from "./realtime";
 import { renderActiveBoard, renderResolvedList, renderProductionTiles, renderConnectionStatus, showAlert, tickAges } from "./render";
 
@@ -42,11 +42,11 @@ function upsertIncident(incident: Incident): void {
 // there's exactly one reconcile code path instead of special-casing the
 // first load.
 async function reconcile(): Promise<void> {
-  const [incidentList, productionList] = await Promise.all([fetchIncidents(), fetchProduction()]);
+  const [incidentList, catalog] = await Promise.all([fetchIncidents(), fetchWorkOrderCatalog()]);
   incidents.clear();
   for (const incident of incidentList) incidents.set(incident.incidentId, incident);
   production.clear();
-  for (const entry of productionList) production.set(productionKey(entry.stationId, entry.workOrderId), entry);
+  for (const entry of catalog) production.set(productionKey(entry.stationId, entry.workOrderId), entry);
   renderAll();
 }
 

@@ -38,7 +38,7 @@ import type { AedesPublishPacket, Client } from "aedes";
 import { STATION_CONFIG } from "./config-data";
 import { createOrGetIncident, listIncidents, acknowledgeIncident, startHandlingIncident, resolveIncident } from "./incident-store";
 import { setProductionCount, listProductionCounts, getProductionCount } from "./production-store";
-import { listWorkOrders } from "./work-order-store";
+import { listWorkOrders, listAllWorkOrders } from "./work-order-store";
 import { registerClient, broadcast } from "./realtime";
 
 const HTTP_PORT = Number(process.env.HTTP_PORT ?? 8080);
@@ -261,6 +261,21 @@ app.get<{ Params: { stationId: string } }>(
     return { workOrders };
   },
 );
+
+// All stations' work orders, same productionCount enrichment as the
+// per-station route above - added same day (2026-08-13) so the
+// dashboard's PRODUCTION panel can show the full catalog every station's
+// device picker already shows (including work orders that have never
+// reported a count yet), not just the subset that happened to have
+// reported at least one PRODUCTION_COUNT_UPDATED. See dashboard/PLAN.md's
+// matching note.
+app.get("/api/v1/work-orders", async () => {
+  const workOrders = listAllWorkOrders().map((wo) => ({
+    ...wo,
+    productionCount: getProductionCount(wo.stationId, wo.workOrderId),
+  }));
+  return { workOrders };
+});
 
 app.get("/healthz", async () => ({ status: "ok" }));
 

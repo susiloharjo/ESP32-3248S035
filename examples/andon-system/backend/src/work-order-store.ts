@@ -31,3 +31,19 @@ const WORK_ORDERS_BY_STATION: Record<string, WorkOrder[]> = {
 export function listWorkOrders(stationId: string): WorkOrder[] {
   return WORK_ORDERS_BY_STATION[stationId] ?? [];
 }
+
+// Flattened across every station - backs GET /api/v1/work-orders (all
+// stations), added same day as listWorkOrders() started returning
+// productionCount too (2026-08-13): the dashboard was only ever showing
+// work orders that had already reported at least one count (via
+// production-store.ts, fed by PRODUCTION_COUNT_UPDATED events), so a
+// freshly-seeded work order the device's picker already lists (with
+// productionCount: 0) simply didn't appear on the dashboard yet - "list
+// di hardware dengan list di dashboard beda". This gives the dashboard
+// the same full catalog the device's picker uses, not just the subset
+// that happens to have reported something.
+export function listAllWorkOrders(): Array<WorkOrder & { stationId: string }> {
+  return Object.entries(WORK_ORDERS_BY_STATION).flatMap(([stationId, workOrders]) =>
+    workOrders.map((wo) => ({ ...wo, stationId })),
+  );
+}
