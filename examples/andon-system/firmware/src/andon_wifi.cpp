@@ -112,27 +112,90 @@ bool AndonWifi::connectSavedOrFallback(lv_obj_t *statusLabel) {
   return false;
 }
 
-// --- QWERTY keyboard (EXPERIMENTAL - branch experiment/qwerty-wifi-keyboard,
-// 2026-08-13) --------------------------------------------------------------
+// --- Custom big-key QWERTY-ish keyboard (EXPERIMENTAL - branch
+// experiment/qwerty-wifi-keyboard, 2026-08-13) -------------------------------
 //
-// Replaces the T9 multi-tap grid (gemini-chatbot's original design, ported
-// here as-is until now) with LVGL's built-in lv_keyboard widget, sized to
-// use nearly the full screen width for bigger keys ("agak besar supaya
-// ngga miss klik" - explicit request). Trades away T9's "no real keyboard,
-// stays true to the feature-phone bit" identity for standard-QWERTY speed
-// and (hopefully) fewer mis-taps - that trade is exactly what this branch
-// exists to evaluate before deciding whether to bring it back to main.
+// v2 of this experiment. v1 (see git log on this branch) tried LVGL's stock
+// lv_keyboard widget - full 26-key QWERTY, uniform key size. Follow-up
+// request: "kalau buat custom yang penting untuk key2 penting dibuat agak
+// gede, untuk yg jarang2 kepake dibuat multiple" - i.e. don't size every
+// key the same; give commonly-used keys more room and fold rarely-used
+// letters onto shared multi-tap keys (T9-style cycling, but only for the
+// few letters that are actually rare - not the whole alphabet like the
+// original phone-number-pad T9 did).
 //
-// lv_keyboard handles character insertion/backspace/cursor-move/shift/
-// mode-switching internally once bound to a textarea (lv_keyboard_set_
-// textarea()) - none of the T9 multi-tap-cycle bookkeeping below is
-// needed anymore. Its default map's bottom-left key (a "keyboard" glyph)
-// fires LV_EVENT_CANCEL - repurposed as this screen's Back button (see
-// onPwKeyboardEvent()) instead of the old dedicated s_pwBackBtn widget,
-// and its OK key fires LV_EVENT_READY - repurposed as Send/Save (was
-// T9_SEND_IDX). See lv_keyboard_def_event_cb() in
-// lib/lvgl/src/extra/widgets/keyboard/lv_keyboard.c for exactly what
-// triggers what.
+// Letters grouped by rough English-frequency (j+k and z+x+v are each
+// English's least-common letters - merging them costs little in typing
+// speed since they're rarely needed, and buys real width back for every
+// other key in their row):
+//   Row 1 (10 keys): q w e r t y u i o p - unmodified, no good low-
+//     frequency candidate to merge here without also giving up a common one
+//   Row 2 (8 keys):  a s d f g h [j/k] l
+//   Row 3 (7 keys):  Shift [z/x/v] c b n m Backspace
+//   Row 4 (3 keys):  123 (switch to number/symbol mode) | Space | Send
+// vs. the stock keyboard's ~40 cells across 5 rows - fewer, bigger cells,
+// especially in rows 2-3 (~8-22% wider) and row 4 (Space/Send are each
+// nearly 1/3 of the full 460px width).
+//
+// Multi-tap cycling on the [j/k] and [z/x/v] keys reuses the exact
+// mechanism gemini-chatbot's/this branch's original T9 grid used (repeated
+// taps within KEY_CYCLE_TIMEOUT_MS delete-and-advance instead of insert) -
+// see s_cycleLastIdx/s_cyclePos/s_cycleLastMs and onPwKeypad() below.
+// Every other letter, digit, and symbol is a single, immediate tap - only
+// those two keys actually cycle.
+#define KEY_CYCLE_TIMEOUT_MS 600
+
+// --- LOWER/UPPER letter mode -------------------------------------------------
+// Row breaks are literal "\n" array entries (lv_btnmatrix convention); a
+// "\n" INSIDE a cell's own string (e.g. "j\nk") instead makes a 2-line
+// label on that one button - LVGL draws it centered, stacked.
+static const char *wifiKbMapLower[] = {
+  "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "\n",
+  "a", "s", "d", "f", "g", "h", "j\nk", "l", "\n",
+  LV_SYMBOL_UP, "z\nx\nv", "c", "b", "n", "m", LV_SYMBOL_BACKSPACE, "\n",
+  "123", "SPACE", LV_SYMBOL_OK, "",
+};
+static const char *wifiKbMapUpper[] = {
+  "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "\n",
+  "A", "S", "D", "F", "G", "H", "J\nK", "L", "\n",
+  LV_SYMBOL_UP, "Z\nX\nV", "C", "B", "N", "M", LV_SYMBOL_BACKSPACE, "\n",
+  "123", "SPACE", LV_SYMBOL_OK, "",
+};
+// Index -> the actual character(s) that cell cycles through (case-folded;
+// shift uppercases at insert time, same as the old T9 code did - see
+// onPwKeypad()). NULL entries are control cells (Shift/Backspace/123/
+// Space/Send), handled by index instead of a cycle lookup.
+static const char *wifiKbCycleLower[] = {
+  "q", "w", "e", "r", "t", "y", "u", "i", "o", "p",              // 0-9
+  "a", "s", "d", "f", "g", "h", "jk", "l",                       // 10-17
+  NULL, "zxv", "c", "b", "n", "m", NULL,                         // 18-24 (18=Shift, 24=Backspace)
+  NULL, NULL, NULL,                                              // 25-27 (123, Space, Send)
+};
+static const int KB_SHIFT_IDX = 18;
+static const int KB_LETTER_BACKSPACE_IDX = 24;
+static const int KB_MODE_IDX = 25;
+static const int KB_SPACE_IDX = 26;
+static const int KB_SEND_IDX = 27;
+
+// --- Number/symbol mode ------------------------------------------------------
+// No grouping here - digits and the symbols routers actually put in
+// passwords are all "important", nothing to fold together.
+static const char *wifiKbMapNumber[] = {
+  "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "\n",
+  "@", "#", "$", "%", "^", "&", "*", "-", "_", ".", LV_SYMBOL_BACKSPACE, "\n",
+  "ABC", "SPACE", LV_SYMBOL_OK, "",
+};
+static const int KB_NUMBER_BACKSPACE_IDX = 20;
+static const int KB_NUMBER_ABC_IDX = 21;
+static const int KB_NUMBER_SPACE_IDX = 22;
+static const int KB_NUMBER_SEND_IDX = 23;
+
+enum KbMode { KB_MODE_LOWER, KB_MODE_UPPER, KB_MODE_NUMBER };
+static KbMode s_kbMode = KB_MODE_LOWER;
+
+static int s_cycleLastIdx = -1;
+static int s_cyclePos = 0;
+static uint32_t s_cycleLastMs = 0;
 
 // --- Screen state ------------------------------------------------------------
 
@@ -152,19 +215,18 @@ static int s_listCount = 0;
 static lv_obj_t *s_pwTitle = nullptr;
 static lv_obj_t *s_pwTa = nullptr;
 static lv_obj_t *s_pwStatusLabel = nullptr;
-static lv_obj_t *s_pwKb = nullptr; // lv_keyboard now, not lv_btnmatrix - see the QWERTY comment above
+static lv_obj_t *s_pwKb = nullptr; // custom lv_btnmatrix - see the keyboard comment block above
 static String s_setupSsid = "";
 
 // "Server" tab - same screen, same keyboard, different target textarea.
-// s_activeTa is whichever of s_pwTa/s_serverTa is currently bound to the
-// keyboard; kept as its own pointer (updated by onTabToggle() and
-// showPasswordView(), which also call lv_keyboard_set_textarea(s_pwKb, ...)
-// to keep the widget's own binding in sync - see applyTabVisibility()) so
-// onPwKeyboardEvent() doesn't need to branch on s_onServerTab for anything
-// but which save/connect action READY should trigger.
+// s_activeTa is whichever of s_pwTa/s_serverTa the keyboard is currently
+// writing into; kept as its own pointer (updated by onTabToggle() and
+// showPasswordView()) so onPwKeypad() doesn't need to know about tabs at
+// all beyond which save/connect action Send should trigger.
 static bool s_onServerTab = false;
 static lv_obj_t *s_serverTa = nullptr;
 static lv_obj_t *s_tabBtn = nullptr;
+static lv_obj_t *s_pwBackBtn = nullptr;
 static lv_obj_t *s_activeTa = nullptr;
 
 static bool s_setupRequested = false;
@@ -177,6 +239,7 @@ void AndonWifi::clearSetupRequest() { s_setupRequested = false; }
 
 static void showListView();
 static void showPasswordView(const String &ssid);
+static void applyKbMap();
 
 static void updateListRows() {
   if (s_listCount <= 0) {
@@ -220,16 +283,14 @@ static void showListView() {
   lv_obj_add_flag(s_serverTa, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_pwStatusLabel, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_tabBtn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(s_pwBackBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_pwKb, LV_OBJ_FLAG_HIDDEN);
 }
 
 // Shows whichever of s_pwTa/s_serverTa matches s_onServerTab, updates the
 // title and the tab button's own label to name the OTHER tab (what tapping
-// it switches to), and points both s_activeTa and the keyboard's own
-// binding (lv_keyboard_set_textarea()) at the now-visible field - the
-// keyboard widget routes keystrokes via its own internal ->ta pointer, not
-// s_activeTa, so both must stay in sync (onPwKeyboardEvent() only needs
-// s_activeTa for reading the final text out on READY).
+// it switches to), and points s_activeTa at the now-visible field so
+// onPwKeypad() doesn't need to know about tabs at all.
 static void applyTabVisibility() {
   if (s_onServerTab) {
     lv_label_set_text(s_pwTitle, "Backend server IP/domain");
@@ -242,7 +303,6 @@ static void applyTabVisibility() {
     lv_obj_add_flag(s_serverTa, LV_OBJ_FLAG_HIDDEN);
     s_activeTa = s_pwTa;
   }
-  lv_keyboard_set_textarea(s_pwKb, s_activeTa);
 }
 
 static void onTabToggle(lv_event_t *e) {
@@ -262,7 +322,8 @@ static void onTabToggle(lv_event_t *e) {
 static void showPasswordView(const String &ssid) {
   s_setupSsid = ssid;
   s_onServerTab = false; // always reopen on the WiFi tab, not wherever it was left
-  lv_keyboard_set_mode(s_pwKb, LV_KEYBOARD_MODE_TEXT_LOWER); // reset shift/special-chars state from any previous visit
+  s_kbMode = KB_MODE_LOWER; // reset shift/number-mode state from any previous visit
+  applyKbMap();
   lv_textarea_set_text(s_pwTa, "");
   lv_label_set_text(s_pwStatusLabel, "");
   lv_obj_t *tabLabel = lv_obj_get_child(s_tabBtn, 0);
@@ -283,24 +344,15 @@ static void showPasswordView(const String &ssid) {
   lv_obj_clear_flag(s_pwTitle, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_pwStatusLabel, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_tabBtn, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_clear_flag(s_pwBackBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_pwKb, LV_OBJ_FLAG_HIDDEN);
 }
 
-// lv_keyboard handles every ordinary keystroke (letters, backspace,
-// cursor-move, shift, special-chars mode) internally once bound via
-// lv_keyboard_set_textarea() - the only two things this firmware still
-// needs to react to are its READY (OK key - was T9_SEND_IDX) and CANCEL
-// (the keyboard-glyph key - repurposed as Back, was s_pwBackBtn) events.
-// See the QWERTY comment block above for exactly which key fires which.
-static void onPwKeyboardEvent(lv_event_t *e) {
-  lv_event_code_t code = lv_event_get_code(e);
+static void onBackToList(lv_event_t *e) { showListView(); }
 
-  if (code == LV_EVENT_CANCEL) {
-    showListView();
-    return;
-  }
-  if (code != LV_EVENT_READY) return;
-
+// Send (WiFi tab) / Save (Server tab) - shared by both letter mode's
+// KB_SEND_IDX and number mode's KB_NUMBER_SEND_IDX (see onPwKeypad()).
+static void triggerSendOrSave() {
   if (s_onServerTab) {
     // Just persists the field and stays on this screen - unlike the WiFi
     // tab's Send, there's no "did it work" to test synchronously (that
@@ -322,6 +374,85 @@ static void onPwKeyboardEvent(lv_event_t *e) {
   } else {
     lv_label_set_text(s_pwStatusLabel, "Failed - check password, try again");
   }
+}
+
+// Swaps s_pwKb's map to match s_kbMode and invalidates any in-progress
+// multi-tap cycle (switching maps mid-cycle would otherwise delete/replace
+// a character on a now-different key - see onPwKeypad()'s cycle handling).
+static void applyKbMap() {
+  const char **map = (s_kbMode == KB_MODE_NUMBER) ? wifiKbMapNumber
+                    : (s_kbMode == KB_MODE_UPPER) ? wifiKbMapUpper
+                    : wifiKbMapLower;
+  lv_btnmatrix_set_map(s_pwKb, map);
+  s_cycleLastIdx = -1;
+}
+
+static void onPwKeypad(lv_event_t *e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  lv_obj_t *btnm = lv_event_get_target(e);
+  uint16_t idx = lv_btnmatrix_get_selected_btn(btnm);
+  if (idx == LV_BTNMATRIX_BTN_NONE) return;
+
+  if (s_kbMode == KB_MODE_NUMBER) {
+    if (idx == KB_NUMBER_BACKSPACE_IDX) { lv_textarea_del_char(s_activeTa); return; }
+    if (idx == KB_NUMBER_ABC_IDX) { s_kbMode = KB_MODE_LOWER; applyKbMap(); return; }
+    if (idx == KB_NUMBER_SPACE_IDX) { lv_textarea_add_char(s_activeTa, ' '); return; }
+    if (idx == KB_NUMBER_SEND_IDX) { triggerSendOrSave(); return; }
+    // Every other cell in number mode is a direct single-char insert - no
+    // cycling, see the "no grouping here" comment on wifiKbMapNumber.
+    const char *txt = lv_btnmatrix_get_btn_text(btnm, idx);
+    if (txt && txt[0]) lv_textarea_add_char(s_activeTa, txt[0]);
+    return;
+  }
+
+  // Letter modes (LOWER/UPPER) share the same index layout.
+  if (idx == KB_SHIFT_IDX) {
+    s_kbMode = (s_kbMode == KB_MODE_UPPER) ? KB_MODE_LOWER : KB_MODE_UPPER;
+    applyKbMap();
+    return;
+  }
+  if (idx == KB_LETTER_BACKSPACE_IDX) {
+    lv_textarea_del_char(s_activeTa);
+    s_cycleLastIdx = -1;
+    return;
+  }
+  if (idx == KB_MODE_IDX) {
+    s_kbMode = KB_MODE_NUMBER;
+    applyKbMap();
+    return;
+  }
+  if (idx == KB_SPACE_IDX) {
+    lv_textarea_add_char(s_activeTa, ' ');
+    s_cycleLastIdx = -1;
+    return;
+  }
+  if (idx == KB_SEND_IDX) {
+    triggerSendOrSave();
+    return;
+  }
+
+  // Ordinary letter or one of the two grouped keys ([j/k], [z/x/v]) -
+  // same repeated-tap-cycles-through-the-cell's-characters mechanism the
+  // original T9 grid used, just with per-key cycle length 1-3 instead of
+  // always the full phone-pad group.
+  const char *cycle = wifiKbCycleLower[idx];
+  if (!cycle) return;
+  int cycleLen = (int)strlen(cycle);
+
+  uint32_t now = millis();
+  bool cyclingSameKey = (idx == s_cycleLastIdx) && (now - s_cycleLastMs < KEY_CYCLE_TIMEOUT_MS);
+  if (cyclingSameKey) {
+    lv_textarea_del_char(s_activeTa);
+    s_cyclePos = (s_cyclePos + 1) % cycleLen;
+  } else {
+    s_cyclePos = 0;
+  }
+
+  char ch = cycle[s_cyclePos];
+  if (s_kbMode == KB_MODE_UPPER && ch >= 'a' && ch <= 'z') ch = ch - 'a' + 'A';
+  lv_textarea_add_char(s_activeTa, ch);
+  s_cycleLastIdx = idx;
+  s_cycleLastMs = now;
 }
 
 static void onSkip(lv_event_t *e) {
@@ -547,13 +678,27 @@ static void createSetupScreen() {
   lv_obj_set_style_text_color(s_pwStatusLabel, lv_color_hex(0xffffff), 0);
   lv_obj_align(s_pwStatusLabel, LV_ALIGN_TOP_MID, 0, 80);
 
-  // Single small button now (was a 3-stacked column: Symbols/Back/Tab) -
-  // lv_keyboard's own OK/keyboard-glyph keys cover Send and Back (see
-  // onPwKeyboardEvent()), and its own "1#"/"ABC" keys cover symbols/shift,
-  // so only the WiFi<->Server tab switch still needs a dedicated widget.
-  // Freeing that column's width is the actual point of this experiment -
-  // bigger QWERTY keys, not just fitting one more button.
+  // Two small buttons side by side (was a 3-stacked column: Symbols/Back/
+  // Tab) - the custom keyboard's own 123/Send cells (and Shift for case)
+  // cover what Symbols used to, so only Back and the WiFi<->Server tab
+  // switch still need dedicated widgets. Both sit in the same y=113
+  // dead-zone-safe row as the keyboard's row 1 starts just below them -
+  // freeing the rest of that column's width is the actual point of this
+  // experiment, not just fitting one more button.
   const int32_t PW_BTN_W = 70, PW_BTN_H = 36;
+  s_pwBackBtn = lv_btn_create(lv_scr_act());
+  lv_obj_set_size(s_pwBackBtn, PW_BTN_W, PW_BTN_H);
+  lv_obj_align(s_pwBackBtn, LV_ALIGN_TOP_RIGHT, -86, 113);
+  lv_obj_add_event_cb(s_pwBackBtn, onBackToList, LV_EVENT_CLICKED, NULL);
+  lv_obj_set_style_radius(s_pwBackBtn, 12, 0);
+  lv_obj_set_style_bg_color(s_pwBackBtn, lv_color_hex(0x1e293b), 0);
+  lv_obj_set_style_border_width(s_pwBackBtn, 1, 0);
+  lv_obj_set_style_border_color(s_pwBackBtn, lv_color_hex(0x22c55e), 0);
+  lv_obj_t *backLabel = lv_label_create(s_pwBackBtn);
+  lv_label_set_text(backLabel, LV_SYMBOL_LEFT " Back");
+  lv_obj_set_style_text_font(backLabel, &lv_font_montserrat_12, 0);
+  lv_obj_center(backLabel);
+
   s_tabBtn = lv_btn_create(lv_scr_act());
   lv_obj_set_size(s_tabBtn, PW_BTN_W, PW_BTN_H);
   lv_obj_align(s_tabBtn, LV_ALIGN_TOP_RIGHT, -10, 113);
@@ -568,17 +713,15 @@ static void createSetupScreen() {
   lv_obj_set_style_text_align(tabLabel, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_center(tabLabel);
 
-  // QWERTY keyboard - nearly full content width (460 of 480) for bigger
-  // keys than the old T9 grid's 380px had room for, starting right below
-  // the tab button's row (both start at the same y=113 dead-zone-safe
-  // line - see the CONTENT_W/MARGIN/GAP comment convention this firmware
-  // otherwise uses in main.cpp). lv_keyboard_set_textarea() (called from
-  // applyTabVisibility()) is what actually routes keystrokes - this
-  // create call just builds the widget and styles it to match the rest of
-  // the dark/green theme.
-  s_pwKb = lv_keyboard_create(lv_scr_act());
-  lv_obj_add_event_cb(s_pwKb, onPwKeyboardEvent, LV_EVENT_READY, NULL);
-  lv_obj_add_event_cb(s_pwKb, onPwKeyboardEvent, LV_EVENT_CANCEL, NULL);
+  // Custom big-key keyboard - nearly full content width (460 of 480),
+  // starting right below the Back/Tab row (both start at the same y=113
+  // dead-zone-safe line - see the CONTENT_W/MARGIN/GAP comment convention
+  // this firmware otherwise uses in main.cpp). See the keyboard comment
+  // block near the top of this file for the row/grouping design and
+  // applyKbMap() for how s_kbMode picks which of the three maps is active.
+  s_pwKb = lv_btnmatrix_create(lv_scr_act());
+  applyKbMap();
+  lv_obj_add_event_cb(s_pwKb, onPwKeypad, LV_EVENT_VALUE_CHANGED, NULL);
   lv_obj_set_style_bg_opa(s_pwKb, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(s_pwKb, 0, 0);
   lv_obj_set_style_pad_all(s_pwKb, 4, 0);
