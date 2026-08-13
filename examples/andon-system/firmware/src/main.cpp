@@ -1176,10 +1176,6 @@ static void onActiveAddNote(lv_event_t *e) {
   Serial.println("[demo] ADD NOTE tapped (preset-note list not implemented yet)");
 }
 
-// DEMO ONLY: stands in for a technician's own device acknowledging the
-// request - the operator terminal has no real control over this.
-static void onSimulateAck(lv_event_t *e) { showScreenAcknowledged(); }
-
 static void onOfflineRetry(lv_event_t *e) {
   g_andon.mockConnected = true;
   updateHeaderConnDot();
@@ -1188,16 +1184,33 @@ static void onOfflineRetry(lv_event_t *e) {
 
 static void onOfflineCancel(lv_event_t *e) { cancelRequest(); }
 
-// TODO(backend): replace with MQTT publish to andon/v1/.../status. Doubles
-// as the demo's way to step Acknowledged -> Handling -> Resolved, since a
-// real "handling" update would normally come from the technician's device.
+// Start Handling / Resolve are deliberately device-only (product decision,
+// 2026-08-13 - see AndonMqtt::submitStatusUpdate()'s comment): the
+// dashboard's Acknowledge is the only transition that can happen remotely,
+// so this is now the ONE real place those two ever get triggered from,
+// same "never claim accepted without proof" rule as everywhere else in
+// this file - only advances the screen once the backend actually confirms
+// it (blocks briefly, same as submitRequest()/onReasonSend()).
 static void onUpdateStatus(lv_event_t *e) {
+  if (g_andon.incidentId.length() == 0) {
+    Serial.println("AndonMqtt: UPDATE STATUS tapped with no known incidentId - ignoring");
+    return;
+  }
+
   if (!g_andon.handling) {
-    g_andon.handling = true;
-    showScreenAcknowledged();
+    if (AndonMqtt::submitStatusUpdate(g_andon.incidentId.c_str(), "HANDLING")) {
+      g_andon.handling = true;
+      showScreenAcknowledged();
+    } else {
+      Serial.println("AndonMqtt: start-handling update rejected/timed out - staying put");
+    }
   } else {
-    g_andon.downtimeSec = (millis() - g_andon.requestOpenedMs) / 1000;
-    showScreenResolved();
+    if (AndonMqtt::submitStatusUpdate(g_andon.incidentId.c_str(), "RESOLVED")) {
+      g_andon.downtimeSec = (millis() - g_andon.requestOpenedMs) / 1000;
+      showScreenResolved();
+    } else {
+      Serial.println("AndonMqtt: resolve update rejected/timed out - staying put");
+    }
   }
 }
 
@@ -1436,15 +1449,14 @@ static void showScreenActive() {
   lv_obj_t *statusVal = lv_obj_get_child(statusBox, 1);
   if (statusVal) lv_obj_set_style_text_color(statusVal, lv_color_hex(COLOR_FAULT), 0);
 
-  makeButton(g_content, MARGIN, 194, halfW, 40, COLOR_DISABLED,
+  // Taller now that the old "(DEMO) SIMULATE TECHNICIAN ACK" button below
+  // this row is gone - acknowledgement is a real incoming MQTT push now
+  // (see applyIncomingStateUpdate() in loop()), not something this screen
+  // needs to fake for itself.
+  makeButton(g_content, MARGIN, 194, halfW, 76, COLOR_DISABLED,
              LV_SYMBOL_CLOSE "  CANCEL REQUEST", &lv_font_montserrat_16, onActiveCancel, nullptr);
-  makeButton(g_content, MARGIN + halfW + GAP, 194, halfW, 40, COLOR_DISABLED,
+  makeButton(g_content, MARGIN + halfW + GAP, 194, halfW, 76, COLOR_DISABLED,
              LV_SYMBOL_EDIT "  ADD NOTE", &lv_font_montserrat_16, onActiveAddNote, nullptr);
-
-  lv_obj_t *demoBtn = makeButton(g_content, (CONTENT_W - 280) / 2, 240, 280, 36, COLOR_BG_RAISED,
-                                  "(DEMO) SIMULATE TECHNICIAN ACK", &lv_font_montserrat_12, onSimulateAck, nullptr);
-  lv_obj_set_style_border_width(demoBtn, 1, 0);
-  lv_obj_set_style_border_color(demoBtn, lv_color_hex(COLOR_DISABLED), 0);
 }
 
 // SCR-04B - Queued offline
@@ -1639,8 +1651,52 @@ void setup() {
   Serial.println("Setup done.");
 }
 
+// Reacts to a real incident-state push from the backend - the dashboard's
+// Acknowledge/Start Handling/Resolve actions (see AndonMqtt::hasStateUpdate()'s
+// comment). This is what the old "(DEMO) SIMULATE TECHNICIAN ACK" button
+// stood in for; it's gone now that this is real.
+static void applyIncomingStateUpdate(const String &incidentId, const String &status) {
+  bool hasOpenIncident = (g_andon.screen == SCR_ACTIVE || g_andon.screen == SCR_QUEUED_OFFLINE ||
+                          g_andon.screen == SCR_ACKNOWLEDGED);
+  if (!hasOpenIncident) {
+    Serial.printf("AndonMqtt: state update for %s (status=%s) ignored - no open incident on screen\r\n",
+                  incidentId.c_str(), status.c_str());
+    return;
+  }
+  // g_andon.incidentId is only set once submitRequest() gets ACCEPTED (see
+  // its comment) - empty while still QueuedOffline, in which case there's
+  // nothing to match against yet and any push is stale/unexpected.
+  if (g_andon.incidentId.length() == 0 || incidentId != g_andon.incidentId) {
+    Serial.printf("AndonMqtt: state update for %s ignored - doesn't match open incident '%s'\r\n",
+                  incidentId.c_str(), g_andon.incidentId.c_str());
+    return;
+  }
+
+  if (status == "ACKNOWLEDGED") {
+    g_andon.handling = false;
+    showScreenAcknowledged();
+  } else if (status == "HANDLING") {
+    g_andon.handling = true;
+    showScreenAcknowledged();
+  } else if (status == "RESOLVED") {
+    g_andon.downtimeSec = (millis() - g_andon.requestOpenedMs) / 1000;
+    showScreenResolved();
+  } else {
+    Serial.printf("AndonMqtt: unrecognized state '%s' for %s - ignored\r\n", status.c_str(), incidentId.c_str());
+  }
+}
+
 void loop() {
   lv_timer_handler();
+
+  // Keeps the MQTT connection alive and processes incoming messages -
+  // top-level only, see AndonMqtt::poll()'s comment.
+  AndonMqtt::poll();
+  if (AndonMqtt::hasStateUpdate()) {
+    String incidentId, status;
+    AndonMqtt::consumeStateUpdate(incidentId, status);
+    applyIncomingStateUpdate(incidentId, status);
+  }
 
   // See onOpenConfig()'s comment: AndonWifi::runSetupFlow() must only ever
   // be called from here (top-level, outside any LVGL event callback) - it

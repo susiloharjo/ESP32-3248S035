@@ -23,19 +23,33 @@ export function tickAges(): void {
   });
 }
 
+// Acknowledge is the only transition the dashboard can drive - Start
+// Handling and Resolve are deliberately device-only (see backend/src/
+// server.ts's INCIDENT_STATUS_UPDATE handler and its comment): a
+// technician has to be physically at the terminal to advance past
+// Acknowledged. Once acknowledged, the card just says so instead of
+// offering a button for something this UI isn't allowed to do (backend
+// doesn't expose those endpoints either - see agents.md §11, "hiding a
+// button is not authorization" - this mirrors that on both ends).
 const NEXT_ACTION: Record<string, { action: string; label: string } | undefined> = {
   OPEN: { action: "acknowledge", label: "Acknowledge" },
-  ACKNOWLEDGED: { action: "start-handling", label: "Start Handling" },
-  HANDLING: { action: "resolve", label: "Resolve" },
+};
+
+const WAITING_ON_DEVICE_TEXT: Record<string, string | undefined> = {
+  ACKNOWLEDGED: "Awaiting technician on-site to start handling",
+  HANDLING: "Awaiting technician on-site to resolve",
 };
 
 function incidentCard(incident: Incident): string {
   const categoryColor = CATEGORY_COLORS[incident.categoryCode] ?? "#52636C";
   const statusColor = STATUS_COLORS[incident.status] ?? "#52636C";
   const next = NEXT_ACTION[incident.status];
+  const waitingText = WAITING_ON_DEVICE_TEXT[incident.status];
   const actionHtml = next
     ? `<button class="action-btn" data-incident-id="${incident.incidentId}" data-action="${next.action}" style="background:${categoryColor}">${next.label}</button>`
-    : "";
+    : waitingText
+      ? `<p class="waiting-on-device">${waitingText}</p>`
+      : "";
 
   return `
     <article class="card" style="border-color:${categoryColor}">

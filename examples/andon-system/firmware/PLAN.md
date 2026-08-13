@@ -118,11 +118,13 @@ Backend/MQTT integration landed via the `wifi-manager-improvements` merge (2026-
 - **Send Request** (SCR-03 → SCR-04) — `AndonMqtt::submitAndonRequest()`, blocks for the backend's `COMMAND_RESULT`, only reports success on an actual `ACCEPTED`
 - **Production count update** — `AndonMqtt::submitProductionUpdate()`, same accept/reject mechanics (ad-hoc extension, not in architectur.md §8 - see that file's own note)
 
+**Now real, MQTT-driven both ways (2026-08-13):** `andon_mqtt.cpp` subscribes (`.../result` and `.../state` topics, `AndonMqtt::poll()` called every `loop()` cycle) as well as publishes. The `(DEMO) SIMULATE TECHNICIAN ACK` button/`onSimulateAck` handler is gone entirely — replaced by two real paths:
+- **Acknowledge** — still dashboard-initiated (the one transition a technician's own device push can drive remotely): backend pushes `.../state`, firmware's `applyIncomingStateUpdate()` (in `main.cpp`, called from `loop()` via `AndonMqtt::hasStateUpdate()`/`consumeStateUpdate()`) matches it against `g_andon.incidentId` and moves to SCR-05.
+- **`UPDATE STATUS`** (SCR-05's Ack→Handling and Handling→Resolve steps) and **`CONFIRM & RUN`** (SCR-06 resolve/close) — **product decision, 2026-08-13: device-only, not dashboard-triggerable.** A technician must be physically at the terminal to advance past Acknowledged. `onUpdateStatus()` now calls `AndonMqtt::submitStatusUpdate(incidentId, "HANDLING"|"RESOLVED")`, same blocking/wait-for-`COMMAND_RESULT` contract as `submitAndonRequest()` — only advances the screen on an actual backend accept. Enforced server-side too: `backend/src/server.ts` no longer exposes `POST .../start-handling` or `.../resolve` REST routes at all (removed, not just hidden from the dashboard UI — agents.md §11, "hiding a button is not authorization"; see `dashboard/PLAN.md`'s matching status-header note).
+
 **Still local mock state only** (no MQTT call at all — `TODO(backend)` comments mark these in `main.cpp`):
 - `CANCEL REQUEST` (SCR-04)
 - `ADD NOTE` (SCR-04) — literal no-op, not even a preset-note list yet
-- `UPDATE STATUS` / the Ack→Handling progression (SCR-05) — architecturally this should arrive *from* the backend (a technician's own device acknowledging), which needs MQTT **subscribe**; only publish exists so far, so `(DEMO) SIMULATE TECHNICIAN ACK` is still standing in for that
-- `CONFIRM & RUN` (SCR-06 resolve/close)
 - SCR-04B QueuedOffline isn't actually reached by a real MQTT failure yet (`submitAndonRequest()` just reports failure on timeout)
 
 **Reliability gaps already flagged in `andon_mqtt.hpp`'s own scope note** (deliberate, for this MVP test slice — not oversights): no persisted offline queue, no retry-with-backoff, no idempotency key surviving a reboot, no TLS/device credentials. All required for production per agents.md §9/§12.

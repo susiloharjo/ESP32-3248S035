@@ -154,10 +154,37 @@ broker.on("publish", (packet: AedesPublishPacket, client: Client | null) => {
     return;
   }
 
+  if (evt.eventType === "INCIDENT_STATUS_UPDATE") {
+    // Device-initiated Start Handling / Resolve - see andon_mqtt.hpp's
+    // submitStatusUpdate() and dashboard/PLAN.md's note on why these two
+    // transitions are deliberately NOT reachable from the dashboard's REST
+    // endpoints (technician must be physically at the terminal - product
+    // decision, 2026-08-13). Acknowledge is the one transition the
+    // dashboard can still drive remotely.
+    const incidentId = evt.payload.incidentId as string;
+    const status = evt.payload.status as string;
+    const incident =
+      status === "HANDLING" ? startHandlingIncident(incidentId)
+      : status === "RESOLVED" ? resolveIncident(incidentId)
+      : undefined;
+
+    if (!incident) {
+      app.log.warn(
+        { incidentId, status },
+        "INCIDENT_STATUS_UPDATE: unknown incidentId or invalid status - not replying (device will time out and can retry)",
+      );
+      return;
+    }
+    broadcast({ type: "incident_updated", incident });
+    app.log.info({ incidentId, status }, "Incident status updated from device");
+    publishResult(evt.deviceId, evt.correlationId, incident.incidentId);
+    return;
+  }
+
   if (evt.eventType !== "ANDON_REQUESTED") {
     app.log.info(
       { eventType: evt.eventType },
-      "AndonEvent: unhandled eventType (only ANDON_REQUESTED/PRODUCTION_COUNT_UPDATED are wired up in this test backend)",
+      "AndonEvent: unhandled eventType (only ANDON_REQUESTED/PRODUCTION_COUNT_UPDATED/INCIDENT_STATUS_UPDATE are wired up in this test backend)",
     );
     return;
   }
@@ -221,25 +248,24 @@ app.get("/api/v1/production", async () => {
   return { production: listProductionCounts() };
 });
 
-function actionHandler(transition: (incidentId: string) => ReturnType<typeof acknowledgeIncident>) {
-  return async (
-    request: { params: { id: string } },
-    reply: { code: (n: number) => { send: (body: unknown) => void } },
-  ) => {
-    const incident = transition(request.params.id);
-    if (!incident) {
-      reply.code(404).send({ error: "incident not found" });
-      return;
-    }
-    broadcast({ type: "incident_updated", incident });
-    publishDeviceState(incident.deviceId, incident.incidentId, incident.status);
-    return { incident };
-  };
-}
-
-app.post<{ Params: { id: string } }>("/api/v1/incidents/:id/acknowledge", actionHandler(acknowledgeIncident));
-app.post<{ Params: { id: string } }>("/api/v1/incidents/:id/start-handling", actionHandler(startHandlingIncident));
-app.post<{ Params: { id: string } }>("/api/v1/incidents/:id/resolve", actionHandler(resolveIncident));
+// Acknowledge is the only incident transition the dashboard can still
+// drive remotely - Start Handling and Resolve are deliberately
+// device-initiated only (see the INCIDENT_STATUS_UPDATE MQTT handler
+// above): a technician has to physically be at the terminal to advance
+// past Acknowledged, by product decision (2026-08-13). Per agents.md §11
+// ("hiding a button is not authorization"), that's enforced here by not
+// exposing the endpoint at all, not just by the dashboard not showing a
+// button for it.
+app.post<{ Params: { id: string } }>("/api/v1/incidents/:id/acknowledge", async (request, reply) => {
+  const incident = acknowledgeIncident(request.params.id);
+  if (!incident) {
+    reply.code(404).send({ error: "incident not found" });
+    return;
+  }
+  broadcast({ type: "incident_updated", incident });
+  publishDeviceState(incident.deviceId, incident.incidentId, incident.status);
+  return { incident };
+});
 
 app.register(async (instance) => {
   instance.get("/api/v1/realtime", { websocket: true }, (socket) => {

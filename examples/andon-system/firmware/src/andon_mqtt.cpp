@@ -22,6 +22,14 @@ static String s_resultIncidentId;
 static String s_resultStatus;
 static String s_waitingCorrelationId;
 
+// Incoming state pushes (dashboard Acknowledge/Start Handling/Resolve) -
+// see andon_mqtt.hpp's hasStateUpdate()/consumeStateUpdate().
+static volatile bool s_stateUpdatePending = false;
+static String s_stateIncidentId;
+static String s_stateStatus;
+
+static uint32_t s_lastConnectAttemptMs = 0;
+
 // "esp32-<mac-no-colons>" - stable across reboots (derived from the radio's
 // MAC), matches architectur.md's "esp32-042"-style deviceId examples
 // closely enough for this test harness without needing a separate
@@ -58,6 +66,20 @@ static void mqttCallback(char *topic, uint8_t *payload, unsigned int length) {
   body.reserve(length);
   for (unsigned int i = 0; i < length; i++) body += (char)payload[i];
 
+  String topicStr(topic);
+  if (topicStr.endsWith("/state")) {
+    // Dashboard-driven push (Acknowledge/Start Handling/Resolve) - see
+    // andon_mqtt.hpp's poll()/hasStateUpdate(). Overwrites any not-yet-
+    // consumed update rather than queueing (single-incident-at-a-time
+    // model, same as the rest of this firmware - see g_andon in main.cpp).
+    extractField(body, "incidentId", s_stateIncidentId);
+    extractField(body, "status", s_stateStatus);
+    s_stateUpdatePending = true;
+    return;
+  }
+
+  // Otherwise assume the .../result topic - a COMMAND_RESULT reply to
+  // whichever publishEventAndAwaitResult() call is currently waiting.
   String correlationId;
   if (!extractField(body, "correlationId", correlationId)) return;
   if (correlationId != s_waitingCorrelationId) return; // not the result we're waiting for
@@ -90,8 +112,10 @@ static bool ensureConnected() {
     return false;
   }
   String resultTopic = "andon/v1/device/" + deviceId() + "/result";
+  String stateTopic = "andon/v1/device/" + deviceId() + "/state";
   s_mqtt.subscribe(resultTopic.c_str());
-  Serial.printf("AndonMqtt: connected, subscribed to %s\r\n", resultTopic.c_str());
+  s_mqtt.subscribe(stateTopic.c_str());
+  Serial.printf("AndonMqtt: connected, subscribed to %s and %s\r\n", resultTopic.c_str(), stateTopic.c_str());
   return true;
 }
 
@@ -183,4 +207,37 @@ bool AndonMqtt::submitProductionUpdate(int productionCount, const char *workOrde
   String innerPayload = String("\"productionCount\":") + String(productionCount) + "," +
                          "\"workOrderId\":\"" + workOrderId + "\"";
   return publishEventAndAwaitResult("PRODUCTION_COUNT_UPDATED", innerPayload);
+}
+
+bool AndonMqtt::submitStatusUpdate(const char *incidentId, const char *status) {
+  String innerPayload = String("\"incidentId\":\"") + incidentId + "\"," +
+                         "\"status\":\"" + status + "\"";
+  return publishEventAndAwaitResult("INCIDENT_STATUS_UPDATE", innerPayload);
+}
+
+void AndonMqtt::poll() {
+  if (WiFi.status() != WL_CONNECTED) return; // nothing to service without a link
+
+  if (!s_mqtt.connected()) {
+    // Throttled - without this, a broker that's down would get a fresh
+    // TCP connect attempt every single loop() cycle (every ~10ms), which
+    // both wastes cycles and could look like a connection-flood to
+    // anything monitoring the broker.
+    uint32_t now = millis();
+    if (now - s_lastConnectAttemptMs < 3000) return;
+    s_lastConnectAttemptMs = now;
+    if (!ensureConnected()) return;
+  }
+
+  s_mqtt.loop();
+}
+
+bool AndonMqtt::hasStateUpdate() {
+  return s_stateUpdatePending;
+}
+
+void AndonMqtt::consumeStateUpdate(String &incidentId, String &status) {
+  incidentId = s_stateIncidentId;
+  status = s_stateStatus;
+  s_stateUpdatePending = false;
 }

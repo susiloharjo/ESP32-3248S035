@@ -2,16 +2,22 @@
 
 #include <Arduino.h>
 
-// MQTT client for submitting an Andon request to the backend - the actual
-// wire-up for main.cpp's submitRequest(), which used to be pure local mock
-// state (see its old TODO(backend) comment). Topic/envelope shape from
-// architectur.md §8 (topic convention, event envelope, delivery semantics)
-// - see contracts/ for the config-fetch HTTP contract's equivalent; this
-// doesn't have its own contracts/ doc yet (see the SCOPE note below).
+// MQTT client for the backend - publishes Send Request/production updates
+// (the wire-up for main.cpp's submitRequest(), which used to be pure local
+// mock state) and, as of poll()/hasStateUpdate() below, subscribes to
+// receive incident state pushed back from the dashboard (Acknowledge/Start
+// Handling/Resolve), replacing what used to be a local "(DEMO) SIMULATE
+// TECHNICIAN ACK" button. Topic/envelope shape from architectur.md §8
+// (topic convention, event envelope, delivery semantics) for the publish
+// side; the device-state topic/shape is provisional (see
+// dashboard/PLAN.md §8) since it isn't in architectur.md at all yet - see
+// contracts/ for the config-fetch HTTP contract's equivalent, this doesn't
+// have its own contracts/ doc yet.
 //
-// SCOPE - this is the minimal slice needed to test Send Request end-to-end
-// against backend/'s test server (see that package's own scope note), NOT
-// the full agents.md §9 firmware reliability story:
+// SCOPE - this is the minimal slice needed to test Send Request +
+// dashboard acknowledge/resolve end-to-end against backend/'s test server
+// (see that package's own scope note), NOT the full agents.md §9 firmware
+// reliability story:
 //  - One synchronous attempt per tap: connect, publish QoS 1, wait
 //    (bounded) for the COMMAND_RESULT. No persisted offline queue, no
 //    retry-with-backoff, no idempotency key surviving a reboot (agents.md
@@ -49,5 +55,38 @@ bool submitAndonRequest(const char *categoryCode, const char *reasonCode,
 // Returns true only once the backend actually acks it (same "never claim
 // accepted without proof" rule as submitAndonRequest()).
 bool submitProductionUpdate(int productionCount, const char *workOrderId);
+
+// Device-initiated Start Handling / Resolve - the counterpart to
+// hasStateUpdate()'s incoming Acknowledge push. Deliberately NOT symmetric
+// with that push: Acknowledge is the one transition the dashboard can
+// still drive remotely (see backend/src/server.ts), but Start Handling and
+// Resolve are restricted to the device on purpose - a technician has to be
+// physically at the terminal to advance past Acknowledged (product
+// decision, 2026-08-13). status must be "HANDLING" or "RESOLVED". Same
+// blocking/wait-for-COMMAND_RESULT contract as submitAndonRequest() -
+// returns true only once the backend actually applied the transition.
+bool submitStatusUpdate(const char *incidentId, const char *status);
+
+// Services the MQTT connection - keeps it alive (reconnecting as needed)
+// and processes incoming messages via PubSubClient::loop(). Call every
+// loop() cycle, top-level only, same as AndonWifi's flag-consuming
+// pattern - this module doesn't call lv_timer_handler() itself so it
+// isn't actually reentrancy-hazardous the way AndonWifi::runSetupFlow()
+// is, but keeping every MQTT/LVGL touch point at loop()'s top level keeps
+// that invariant simple to reason about instead of case-by-case.
+void poll();
+
+// True once a real INCIDENT_STATE_CHANGED push has arrived and not yet
+// been consumed (see backend/src/server.ts's publishDeviceState(), fired
+// by the dashboard's Acknowledge/Start Handling/Resolve actions - see
+// examples/andon-system/dashboard/). This is what replaced main.cpp's old
+// "(DEMO) SIMULATE TECHNICIAN ACK" button.
+bool hasStateUpdate();
+
+// Reads the pending update (status is "ACKNOWLEDGED"/"HANDLING"/
+// "RESOLVED" - matches backend's IncidentStatus) and clears the flag.
+// This module doesn't know about AndonState/screens - matching the
+// incidentId against whatever's currently open is the caller's job.
+void consumeStateUpdate(String &incidentId, String &status);
 
 } // namespace AndonMqtt

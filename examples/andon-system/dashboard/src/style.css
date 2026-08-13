@@ -122,6 +122,19 @@ section h2 {
   font-variant-numeric: tabular-nums;
 }
 
+/* Shown instead of an action button once a card is past OPEN - Start
+   Handling/Resolve are device-only, see render.ts's WAITING_ON_DEVICE_TEXT. */
+.waiting-on-device {
+  margin: 0;
+  padding: 8px;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-secondary);
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+}
+
 .action-btn {
   border: none;
   border-radius: 6px;

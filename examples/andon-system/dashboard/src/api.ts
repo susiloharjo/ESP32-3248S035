@@ -24,11 +24,15 @@ async function postAction(incidentId: string, action: string): Promise<Incident>
   return body.incident;
 }
 
-// No optimistic UI update on any of these (PLAN.md §6: no idempotent-retry
-// story, no server-side state-machine validation yet) - the caller waits
-// for the REST response, and the WebSocket incident_updated broadcast that
-// the backend also sends is what actually drives the re-render (see
-// main.ts) so a second browser tab stays in sync too.
+// No optimistic UI update (PLAN.md §6: no idempotent-retry story, no
+// server-side state-machine validation yet) - the caller waits for the
+// REST response, and the WebSocket incident_updated broadcast that the
+// backend also sends is what actually drives the re-render (see main.ts)
+// so a second browser tab stays in sync too.
+//
+// Acknowledge is the ONLY transition exposed here - Start Handling and
+// Resolve are deliberately device-only (technician must be physically at
+// the terminal, product decision 2026-08-13); the backend doesn't expose
+// those endpoints at all anymore, so there's nothing for this module to
+// call even if a button tried to.
 export const acknowledgeIncident = (id: string) => postAction(id, "acknowledge");
-export const startHandlingIncident = (id: string) => postAction(id, "start-handling");
-export const resolveIncident = (id: string) => postAction(id, "resolve");

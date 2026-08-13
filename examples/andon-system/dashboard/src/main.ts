@@ -1,6 +1,6 @@
 import "./style.css";
 import type { Incident } from "./types";
-import { fetchIncidents, fetchProduction, acknowledgeIncident, startHandlingIncident, resolveIncident } from "./api";
+import { fetchIncidents, fetchProduction, acknowledgeIncident } from "./api";
 import { connectRealtime } from "./realtime";
 import { renderActiveBoard, renderResolvedList, renderProductionTiles, renderConnectionStatus, showAlert, tickAges } from "./render";
 
@@ -65,22 +65,18 @@ connectRealtime(
 
 setInterval(tickAges, 1000);
 
-// Event delegation - one listener for every action button, present or
-// future (cards get replaced wholesale on every render, see render.ts).
+// Event delegation - one listener for every action button. Acknowledge is
+// the only action render.ts ever puts a data-action on (see its
+// NEXT_ACTION comment) - Start Handling/Resolve are device-only now, no
+// button, no case for them here.
 boardEl.addEventListener("click", (e) => {
   const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("[data-action]");
   if (!btn) return;
   const { incidentId, action } = btn.dataset;
-  if (!incidentId || !action) return;
+  if (!incidentId || action !== "acknowledge") return;
 
   btn.disabled = true;
-  const call =
-    action === "acknowledge" ? acknowledgeIncident(incidentId)
-    : action === "start-handling" ? startHandlingIncident(incidentId)
-    : action === "resolve" ? resolveIncident(incidentId)
-    : Promise.reject(new Error(`unknown action ${action}`));
-
-  call
+  acknowledgeIncident(incidentId)
     .then(upsertIncident) // WebSocket incident_updated will also arrive and upsert again - harmless, same data
     .catch((err) => {
       console.error(err);
