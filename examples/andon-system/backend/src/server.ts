@@ -37,7 +37,7 @@ import Aedes from "aedes";
 import type { AedesPublishPacket, Client } from "aedes";
 import { STATION_CONFIG } from "./config-data";
 import { createOrGetIncident, listIncidents, acknowledgeIncident, startHandlingIncident, resolveIncident } from "./incident-store";
-import { setProductionCount, listProductionCounts } from "./production-store";
+import { setProductionCount, listProductionCounts, getProductionCount } from "./production-store";
 import { listWorkOrders } from "./work-order-store";
 import { registerClient, broadcast } from "./realtime";
 
@@ -242,10 +242,23 @@ app.get<{ Params: { stationId: string } }>(
 // extension status as PRODUCTION_COUNT_UPDATED above (see work-order-
 // store.ts's header). Lets the device's WORK ORDER picker (SCR_WORK_ORDER_LIST
 // in firmware/src/main.cpp) show something real instead of a hardcoded id.
+//
+// Each work order is enriched with its current productionCount (from
+// production-store.ts) - added same day as a follow-up fix: the device
+// used to keep its own device-local last-known count per work order,
+// which could silently drift from what's actually on the server/
+// dashboard. The picker now re-fetches this endpoint every time it
+// opens (see firmware/src/andon_workorders.cpp's sync()), so switching
+// work orders always starts from the server's own number.
 app.get<{ Params: { stationId: string } }>(
   "/api/v1/work-orders/stations/:stationId",
   async (request) => {
-    return { workOrders: listWorkOrders(request.params.stationId) };
+    const stationId = request.params.stationId;
+    const workOrders = listWorkOrders(stationId).map((wo) => ({
+      ...wo,
+      productionCount: getProductionCount(stationId, wo.workOrderId),
+    }));
+    return { workOrders };
   },
 );
 

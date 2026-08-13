@@ -19,15 +19,16 @@
 static char s_id[ANDON_WO_MAX][ANDON_WO_ID_LEN];
 static char s_product[ANDON_WO_MAX][ANDON_WO_PRODUCT_LEN];
 static int s_target[ANDON_WO_MAX];
-static int s_productionCount[ANDON_WO_MAX]; // see productionCount()/setProductionCount()
+// The server's own count, not a device-owned value - see
+// productionCount()/setProductionCount()'s comments for why this changed
+// (2026-08-13) from its own separately-NVS-persisted-per-id storage to
+// just another field parsed off the same cached/live-fetched JSON as
+// product/target.
+static int s_productionCount[ANDON_WO_MAX];
 static int s_count = 0;
 static int s_selectedIdx = -1;
 
 static Preferences s_prefs;
-// Separate namespace from s_prefs's "andon_wo" (list/selection) - keyed by
-// each work order's own id (fits NVS's 15-char key limit - "WO-240811-07"
-// is 12 - see productionCount()'s comment for why id, not index).
-static Preferences s_countPrefs;
 
 // Single hardcoded fallback so the terminal is still demoable on a first
 // boot with no cache and no network - same target/id this firmware used
@@ -36,13 +37,15 @@ static void applyPlaceholder() {
   strlcpy(s_id[0], "WO-240811-07", ANDON_WO_ID_LEN);
   strlcpy(s_product[0], "Unknown product", ANDON_WO_PRODUCT_LEN);
   s_target[0] = 120;
+  s_productionCount[0] = 0;
   s_count = 1;
 }
 
-// Parses {"workOrders":[{"workOrderId":"...","product":"...","target":N}]}
-// into s_id/s_product/s_target. Returns true if at least one entry was
-// applied (empty/malformed array is not treated as a hard failure - see
-// andon_config.cpp's applyConfig() for the same convention).
+// Parses {"workOrders":[{"workOrderId":"...","product":"...","target":N,
+// "productionCount":N}]} into s_id/s_product/s_target/s_productionCount.
+// Returns true if at least one entry was applied (empty/malformed array
+// is not treated as a hard failure - see andon_config.cpp's applyConfig()
+// for the same convention).
 static bool applyWorkOrders(JsonDocument &doc) {
   JsonArray arr = doc["workOrders"].as<JsonArray>();
   if (arr.isNull()) {
@@ -61,6 +64,7 @@ static bool applyWorkOrders(JsonDocument &doc) {
     strlcpy(s_id[n], id, ANDON_WO_ID_LEN);
     strlcpy(s_product[n], wo["product"] | "", ANDON_WO_PRODUCT_LEN);
     s_target[n] = wo["target"] | 0;
+    s_productionCount[n] = wo["productionCount"] | 0; // absent (cached pre-2026-08-13 JSON) -> 0
     n++;
   }
 
@@ -120,19 +124,19 @@ static void restoreSelection() {
   s_selectedIdx = 0;
 }
 
-// Loads each currently-known work order's own persisted count (0 if never
-// set - a work order this device has never actually updated). Must run
-// after s_id[]/s_count are finalized for this sync() pass.
-static void loadProductionCounts() {
-  s_countPrefs.begin("andon_woc", true);
-  for (int i = 0; i < s_count; i++) {
-    s_productionCount[i] = s_countPrefs.getInt(s_id[i], 0);
-  }
-  s_countPrefs.end();
-}
-
+// Called once at boot (setup()) AND every time the picker screen opens
+// (main.cpp's onOpenUpdateProduction(), 2026-08-13) - not just at boot
+// like AndonConfig::sync() - specifically so productionCount (see that
+// field's comment above) reflects the server's own number at the moment
+// the operator is about to act on it, not whatever this device last
+// happened to fetch. Safe to call from an LVGL event callback the same
+// way AndonMqtt's blocking calls already are (bounded HTTP timeout, no
+// internal lv_timer_handler() call - see andon_wifi.hpp's reentrancy
+// note for the one pattern that actually isn't safe here).
 void AndonWorkOrders::sync() {
-  // 1. Cached list first, so the picker works offline after the first
+  // 1. Cached list first (from the last successful live fetch below, not
+  // necessarily THIS station's absolute latest - see this function's own
+  // comment), so the picker still works offline after at least one prior
   // successful sync, across reboots - same rationale as AndonConfig::sync().
   s_prefs.begin("andon_wo", true);
   String cached = s_prefs.getString("list_json", "");
@@ -173,7 +177,6 @@ void AndonWorkOrders::sync() {
   }
 
   restoreSelection();
-  loadProductionCounts();
 }
 
 int AndonWorkOrders::count() { return s_count; }
@@ -208,10 +211,14 @@ int AndonWorkOrders::productionCount(int idx) {
   return s_productionCount[idx];
 }
 
+// In-memory only (no NVS write, unlike select()) - the server is the
+// durable source of truth for this value now (see the type's comment
+// above and sync()'s doc comment), not this device. This just keeps the
+// picker showing the operator's own just-confirmed number immediately,
+// without waiting for the next sync() round trip to reflect back what
+// AndonMqtt::submitProductionUpdate() (called right alongside this, see
+// main.cpp's onProductionConfirm()) presumably just told the backend.
 void AndonWorkOrders::setProductionCount(int idx, int count) {
   if (idx < 0 || idx >= s_count) return;
   s_productionCount[idx] = count;
-  s_countPrefs.begin("andon_woc", false);
-  s_countPrefs.putInt(s_id[idx], count);
-  s_countPrefs.end();
 }

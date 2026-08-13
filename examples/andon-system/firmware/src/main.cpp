@@ -1066,7 +1066,19 @@ static void onNeedAssistance(lv_event_t *e) { showScreenCategory(); }
 // Now opens the work-order picker first (SCR_WORK_ORDER_LIST) instead of
 // going straight to the counter - operator picks which WO they're
 // producing against, then updates the count for it (see onWorkOrderSelect()).
+//
+// Re-syncs (2026-08-13, "ga bisa fetch dulu dr dashboard...") before
+// showing the list, not just relying on setup()'s one boot-time sync -
+// each work order's productionCount comes from the backend now (see
+// AndonWorkOrders::sync()'s comment), so the picker should reflect
+// whatever's actually on the server/dashboard at the moment the operator
+// is about to act, not whatever this device happened to fetch at boot.
+// Bounded/blocking (same ~8s-worst-case HTTP timeout as every other sync
+// call in this firmware) but safe to call directly from an LVGL event
+// callback like this - no internal lv_timer_handler() call, unlike
+// AndonWifi::runSetupFlow() (see that header's reentrancy note).
 static void onOpenUpdateProduction(lv_event_t *e) {
+  AndonWorkOrders::sync();
   showScreenWorkOrderList();
 }
 

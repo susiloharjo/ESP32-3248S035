@@ -20,13 +20,16 @@
 // because of this module.
 namespace AndonWorkOrders {
 
-// Call once from setup(), after AndonConfig::sync() (reuses the same
-// WiFi/server-host plumbing - AndonWifi::connectSavedOrFallback()/
-// getServerHost()). Loads the cached list from NVS first, then attempts a
-// live refresh; on success overwrites both the in-memory list and the
-// cache. Also restores the last-selected work order (NVS) if it's still
-// present in the (possibly refreshed) list, defaulting to index 0
-// otherwise. Logs every step/failure to Serial.
+// Call from setup() (reuses AndonConfig::sync()'s WiFi/server-host
+// plumbing - AndonWifi::connectSavedOrFallback()/getServerHost()) AND
+// again every time main.cpp's picker screen opens (2026-08-13 - see
+// productionCount()'s comment for why: the server, not this device, is
+// the source of truth for each work order's count). Loads the cached
+// list from NVS first, then attempts a live refresh; on success
+// overwrites both the in-memory list and the cache. Also restores the
+// last-selected work order (NVS) if it's still present in the (possibly
+// refreshed) list, defaulting to index 0 otherwise. Logs every step/
+// failure to Serial.
 void sync();
 
 // Number of work orders currently known (0 only if fetch AND cache AND
@@ -47,23 +50,30 @@ int selectedIndex();
 // row in main.cpp's SCR_WORK_ORDER_LIST.
 void select(int idx);
 
-// Each work order's OWN last-known production count, persisted (NVS,
-// keyed by that work order's id, not by list index - so it survives the
-// list being re-fetched/reordered) and restored by sync(). Fixes a bug
-// (2026-08-13, "pindah2 wo list angkanya ttp sama yang terakhir di
+// Each work order's OWN production count, as of the last sync() - fixes
+// a bug (2026-08-13, "pindah2 wo list angkanya ttp sama yang terakhir di
 // input") where main.cpp's g_andon.productionCount was a single value
-// shared across every work order - switching from WO A (just updated to
-// 50) to WO B carried A's 50 into B's counter instead of showing B's own
-// count. Device-local only (not fetched from the backend's per-WO
-// production store - see backend/src/production-store.ts - so two
-// different terminals working the same work order can still diverge
-// locally; same "not operator-owned truth" caveat main.cpp's
-// AndonState::productionCount already carried before this existed).
+// shared across every work order (switching from WO A, just updated to
+// 50, to WO B carried A's 50 into B's counter instead of showing B's
+// own).
+//
+// Fetched from the backend as part of the work-orders response itself
+// (server.ts joins each entry with production-store.ts's own per-WO
+// state) - NOT a device-owned value. First cut of this fix (see git log)
+// tried tracking it purely device-locally in NVS; follow-up request
+// ("ga bisa fetch dulu dr dashboard... jadi ngga sesuai dgn yang sudah
+// di server") pointed out that let two different terminals working the
+// same work order drift apart with no way to reconcile. sync() now
+// re-fetches this on every picker-open specifically so it's never more
+// stale than "since I last opened this screen".
 int productionCount(int idx);
 
-// Updates idx's count in memory and NVS - call from main.cpp's
-// onProductionConfirm() alongside (not instead of) the existing
-// AndonMqtt::submitProductionUpdate() call.
+// Updates idx's count in memory only (see productionCount()'s comment -
+// the server is durable storage now, not this function) - call from
+// main.cpp's onProductionConfirm() alongside (not instead of) the
+// existing AndonMqtt::submitProductionUpdate() call, so the picker shows
+// the operator's own just-confirmed number immediately without waiting
+// for the next sync().
 void setProductionCount(int idx, int count);
 
 } // namespace AndonWorkOrders

@@ -37,3 +37,15 @@ export function setProductionCount(stationId: string, count: number, workOrderId
 export function listProductionCounts(): ProductionEntry[] {
   return [...productionByKey.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
+
+// Single-entry lookup, 0 if this work order has never reported a count.
+// Used by server.ts to enrich GET /api/v1/work-orders/stations/:stationId
+// with each work order's current count (2026-08-13) - the device's picker
+// fetches that endpoint fresh every time it opens (see
+// firmware/src/andon_workorders.cpp's sync()) specifically so its counter
+// screen starts from the server's own number instead of a possibly-stale
+// device-local one ("ga bisa fetch dulu dr dashboard... kalau gini jadi
+// ngga sesuai dgn yang sudah di server").
+export function getProductionCount(stationId: string, workOrderId: string): number {
+  return productionByKey.get(key(stationId, workOrderId))?.productionCount ?? 0;
+}

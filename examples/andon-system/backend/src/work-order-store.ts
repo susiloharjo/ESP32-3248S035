@@ -10,6 +10,10 @@
 // STATION_CONFIG (static seed, not real ERP/MES integration - agents.md
 // §10 wants that for production).
 
+// Doesn't include productionCount - that's this station's static seed
+// data (id/product/target), not live state. server.ts's route handler
+// joins each entry with production-store.ts's getProductionCount() before
+// it ever reaches an HTTP response.
 export interface WorkOrder {
   workOrderId: string;
   product: string;
