@@ -112,37 +112,27 @@ bool AndonWifi::connectSavedOrFallback(lv_obj_t *statusLabel) {
   return false;
 }
 
-// --- T9 keypad (password entry only - no chat screen in this firmware) -----
-
-// Grid order: 1 2 3 / 4 5 6 / 7 8 9 / <BACKSPACE> 0 <SHIFT> <SEND>. See
-// gemini-chatbot's T9_CYCLES for the original design notes (multi-tap
-// cycling, "-" living on key 1, Shift swapping the whole map so letters
-// visibly show ABC/abc).
-static const char *T9_CYCLES[13] = {
-  ".,!?-1", "abc2", "def3",
-  "ghi4",   "jkl5", "mno6",
-  "pqrs7",  "tuv8", "wxyz9",
-  NULL,     " 0",   NULL,    NULL,
-};
-static const int T9_BACKSPACE_IDX = 9;
-static const int T9_SHIFT_IDX = 11;
-static const int T9_SEND_IDX = 12;
-static const uint32_t T9_CYCLE_TIMEOUT_MS = 600;
-
-static const char *wifiT9MapLower[] = {
-  "1\n.,!?-", "2\nabc", "3\ndef", "\n",
-  "4\nghi",   "5\njkl", "6\nmno", "\n",
-  "7\npqrs",  "8\ntuv", "9\nwxyz", "\n",
-  LV_SYMBOL_BACKSPACE, "0\n_", LV_SYMBOL_UP, LV_SYMBOL_OK, "",
-};
-static const char *wifiT9MapUpper[] = {
-  "1\n.,!?-", "2\nABC", "3\nDEF", "\n",
-  "4\nGHI",   "5\nJKL", "6\nMNO", "\n",
-  "7\nPQRS",  "8\nTUV", "9\nWXYZ", "\n",
-  LV_SYMBOL_BACKSPACE, "0\n_", LV_SYMBOL_UP, LV_SYMBOL_OK, "",
-};
-
-static const char *WIFI_SYMBOLS_CYCLE = "@#$%^&*-_";
+// --- QWERTY keyboard (EXPERIMENTAL - branch experiment/qwerty-wifi-keyboard,
+// 2026-08-13) --------------------------------------------------------------
+//
+// Replaces the T9 multi-tap grid (gemini-chatbot's original design, ported
+// here as-is until now) with LVGL's built-in lv_keyboard widget, sized to
+// use nearly the full screen width for bigger keys ("agak besar supaya
+// ngga miss klik" - explicit request). Trades away T9's "no real keyboard,
+// stays true to the feature-phone bit" identity for standard-QWERTY speed
+// and (hopefully) fewer mis-taps - that trade is exactly what this branch
+// exists to evaluate before deciding whether to bring it back to main.
+//
+// lv_keyboard handles character insertion/backspace/cursor-move/shift/
+// mode-switching internally once bound to a textarea (lv_keyboard_set_
+// textarea()) - none of the T9 multi-tap-cycle bookkeeping below is
+// needed anymore. Its default map's bottom-left key (a "keyboard" glyph)
+// fires LV_EVENT_CANCEL - repurposed as this screen's Back button (see
+// onPwKeyboardEvent()) instead of the old dedicated s_pwBackBtn widget,
+// and its OK key fires LV_EVENT_READY - repurposed as Send/Save (was
+// T9_SEND_IDX). See lv_keyboard_def_event_cb() in
+// lib/lvgl/src/extra/widgets/keyboard/lv_keyboard.c for exactly what
+// triggers what.
 
 // --- Screen state ------------------------------------------------------------
 
@@ -162,27 +152,20 @@ static int s_listCount = 0;
 static lv_obj_t *s_pwTitle = nullptr;
 static lv_obj_t *s_pwTa = nullptr;
 static lv_obj_t *s_pwStatusLabel = nullptr;
-static lv_obj_t *s_pwSymbolsBtn = nullptr;
-static lv_obj_t *s_pwBackBtn = nullptr;
-static lv_obj_t *s_pwKb = nullptr;
+static lv_obj_t *s_pwKb = nullptr; // lv_keyboard now, not lv_btnmatrix - see the QWERTY comment above
 static String s_setupSsid = "";
 
-// "Server" tab - same screen, same T9 keypad, different target textarea.
-// s_activeTa is whichever of s_pwTa/s_serverTa the keypad is currently
-// writing into; kept as its own pointer (updated by onTabToggle() and
-// showPasswordView()) so onPwKeypad()/onSymbolsBtn() don't need to branch
-// on s_onServerTab themselves.
+// "Server" tab - same screen, same keyboard, different target textarea.
+// s_activeTa is whichever of s_pwTa/s_serverTa is currently bound to the
+// keyboard; kept as its own pointer (updated by onTabToggle() and
+// showPasswordView(), which also call lv_keyboard_set_textarea(s_pwKb, ...)
+// to keep the widget's own binding in sync - see applyTabVisibility()) so
+// onPwKeyboardEvent() doesn't need to branch on s_onServerTab for anything
+// but which save/connect action READY should trigger.
 static bool s_onServerTab = false;
 static lv_obj_t *s_serverTa = nullptr;
 static lv_obj_t *s_tabBtn = nullptr;
 static lv_obj_t *s_activeTa = nullptr;
-
-static int s_t9LastBtnIdx = -1;
-static int s_t9CyclePos = 0;
-static uint32_t s_t9LastPressMs = 0;
-static bool s_t9ShiftOn = false;
-static int s_symCyclePos = 0;
-static uint32_t s_symLastPressMs = 0;
 
 static bool s_setupRequested = false;
 static bool s_setupDone = false;
@@ -236,16 +219,17 @@ static void showListView() {
   lv_obj_add_flag(s_pwTa, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_serverTa, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_pwStatusLabel, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(s_pwSymbolsBtn, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_add_flag(s_pwBackBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_tabBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(s_pwKb, LV_OBJ_FLAG_HIDDEN);
 }
 
 // Shows whichever of s_pwTa/s_serverTa matches s_onServerTab, updates the
 // title and the tab button's own label to name the OTHER tab (what tapping
-// it switches to), and points s_activeTa at the now-visible field so
-// onPwKeypad()/onSymbolsBtn() don't need to know about tabs at all.
+// it switches to), and points both s_activeTa and the keyboard's own
+// binding (lv_keyboard_set_textarea()) at the now-visible field - the
+// keyboard widget routes keystrokes via its own internal ->ta pointer, not
+// s_activeTa, so both must stay in sync (onPwKeyboardEvent() only needs
+// s_activeTa for reading the final text out on READY).
 static void applyTabVisibility() {
   if (s_onServerTab) {
     lv_label_set_text(s_pwTitle, "Backend server IP/domain");
@@ -258,14 +242,11 @@ static void applyTabVisibility() {
     lv_obj_add_flag(s_serverTa, LV_OBJ_FLAG_HIDDEN);
     s_activeTa = s_pwTa;
   }
+  lv_keyboard_set_textarea(s_pwKb, s_activeTa);
 }
 
 static void onTabToggle(lv_event_t *e) {
   s_onServerTab = !s_onServerTab;
-  // A multi-tap cycle in progress on one tab shouldn't bleed into the
-  // other's textarea via a stale s_t9LastBtnIdx/s_symLastPressMs.
-  s_t9LastBtnIdx = -1;
-  s_symLastPressMs = 0;
   lv_label_set_text(s_pwStatusLabel, "");
   if (s_onServerTab) {
     lv_textarea_set_text(s_serverTa, AndonWifi::getServerHost().c_str());
@@ -280,13 +261,8 @@ static void onTabToggle(lv_event_t *e) {
 
 static void showPasswordView(const String &ssid) {
   s_setupSsid = ssid;
-  s_t9LastBtnIdx = -1;
-  s_t9ShiftOn = false;
-  s_symCyclePos = 0;
-  s_symLastPressMs = 0;
   s_onServerTab = false; // always reopen on the WiFi tab, not wherever it was left
-  lv_btnmatrix_set_map(s_pwKb, wifiT9MapLower);
-  lv_btnmatrix_clear_btn_ctrl(s_pwKb, T9_SHIFT_IDX, LV_BTNMATRIX_CTRL_CHECKED);
+  lv_keyboard_set_mode(s_pwKb, LV_KEYBOARD_MODE_TEXT_LOWER); // reset shift/special-chars state from any previous visit
   lv_textarea_set_text(s_pwTa, "");
   lv_label_set_text(s_pwStatusLabel, "");
   lv_obj_t *tabLabel = lv_obj_get_child(s_tabBtn, 0);
@@ -306,90 +282,46 @@ static void showPasswordView(const String &ssid) {
   lv_obj_add_flag(s_skipBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_pwTitle, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_pwStatusLabel, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_clear_flag(s_pwSymbolsBtn, LV_OBJ_FLAG_HIDDEN);
-  lv_obj_clear_flag(s_pwBackBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_tabBtn, LV_OBJ_FLAG_HIDDEN);
   lv_obj_clear_flag(s_pwKb, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void onBackToList(lv_event_t *e) { showListView(); }
+// lv_keyboard handles every ordinary keystroke (letters, backspace,
+// cursor-move, shift, special-chars mode) internally once bound via
+// lv_keyboard_set_textarea() - the only two things this firmware still
+// needs to react to are its READY (OK key - was T9_SEND_IDX) and CANCEL
+// (the keyboard-glyph key - repurposed as Back, was s_pwBackBtn) events.
+// See the QWERTY comment block above for exactly which key fires which.
+static void onPwKeyboardEvent(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
 
-static void onSymbolsBtn(lv_event_t *e) {
-  int cycleLen = (int)strlen(WIFI_SYMBOLS_CYCLE);
-  uint32_t now = millis();
-  bool cycling = (now - s_symLastPressMs < T9_CYCLE_TIMEOUT_MS) && s_symLastPressMs != 0;
-  if (cycling) {
-    lv_textarea_del_char(s_activeTa);
-    s_symCyclePos = (s_symCyclePos + 1) % cycleLen;
+  if (code == LV_EVENT_CANCEL) {
+    showListView();
+    return;
+  }
+  if (code != LV_EVENT_READY) return;
+
+  if (s_onServerTab) {
+    // Just persists the field and stays on this screen - unlike the WiFi
+    // tab's Send, there's no "did it work" to test synchronously (that
+    // only happens once AndonConfig::sync()/AndonMqtt actually reach the
+    // host), so this can't set s_setupDone the way a successful WiFi
+    // connect does.
+    String host = lv_textarea_get_text(s_activeTa);
+    saveServerHost(host);
+    lv_label_set_text(s_pwStatusLabel, "Saved!");
+    return;
+  }
+  String pass = lv_textarea_get_text(s_activeTa);
+  lv_label_set_text(s_pwStatusLabel, "Connecting...");
+  lv_refr_now(NULL);
+  if (tryConnectWifi(s_setupSsid, pass, s_pwStatusLabel)) {
+    saveWifi(s_setupSsid, pass);
+    s_setupConnected = true;
+    s_setupDone = true;
   } else {
-    s_symCyclePos = 0;
+    lv_label_set_text(s_pwStatusLabel, "Failed - check password, try again");
   }
-  lv_textarea_add_char(s_activeTa, WIFI_SYMBOLS_CYCLE[s_symCyclePos]);
-  s_symLastPressMs = now;
-}
-
-static void onPwKeypad(lv_event_t *e) {
-  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-  lv_obj_t *btnm = lv_event_get_target(e);
-  uint16_t idx = lv_btnmatrix_get_selected_btn(btnm);
-  if (idx == LV_BTNMATRIX_BTN_NONE) return;
-
-  if (idx == T9_BACKSPACE_IDX) {
-    lv_textarea_del_char(s_activeTa);
-    s_t9LastBtnIdx = -1;
-    return;
-  }
-  if (idx == T9_SEND_IDX) {
-    s_t9LastBtnIdx = -1;
-    if (s_onServerTab) {
-      // Just persists the field and stays on this screen - unlike the WiFi
-      // tab's Send, there's no "did it work" to test synchronously (that
-      // only happens once AndonConfig::sync()/AndonMqtt actually reach the
-      // host), so this can't set s_setupDone the way a successful WiFi
-      // connect does.
-      String host = lv_textarea_get_text(s_activeTa);
-      saveServerHost(host);
-      lv_label_set_text(s_pwStatusLabel, "Saved!");
-      return;
-    }
-    String pass = lv_textarea_get_text(s_activeTa);
-    lv_label_set_text(s_pwStatusLabel, "Connecting...");
-    lv_refr_now(NULL);
-    if (tryConnectWifi(s_setupSsid, pass, s_pwStatusLabel)) {
-      saveWifi(s_setupSsid, pass);
-      s_setupConnected = true;
-      s_setupDone = true;
-    } else {
-      lv_label_set_text(s_pwStatusLabel, "Failed - check password, try again");
-    }
-    return;
-  }
-  if (idx == T9_SHIFT_IDX) {
-    s_t9ShiftOn = !s_t9ShiftOn;
-    lv_btnmatrix_set_map(btnm, s_t9ShiftOn ? wifiT9MapUpper : wifiT9MapLower);
-    lv_btnmatrix_set_btn_ctrl(btnm, idx, LV_BTNMATRIX_CTRL_CHECKED);
-    if (!s_t9ShiftOn) lv_btnmatrix_clear_btn_ctrl(btnm, idx, LV_BTNMATRIX_CTRL_CHECKED);
-    return;
-  }
-
-  const char *cycle = T9_CYCLES[idx];
-  if (!cycle) return;
-  int cycleLen = (int)strlen(cycle);
-
-  uint32_t now = millis();
-  bool cyclingSameKey = (idx == s_t9LastBtnIdx) && (now - s_t9LastPressMs < T9_CYCLE_TIMEOUT_MS);
-  if (cyclingSameKey) {
-    lv_textarea_del_char(s_activeTa);
-    s_t9CyclePos = (s_t9CyclePos + 1) % cycleLen;
-  } else {
-    s_t9CyclePos = 0;
-  }
-
-  char ch = cycle[s_t9CyclePos];
-  if (s_t9ShiftOn && ch >= 'a' && ch <= 'z') ch = ch - 'a' + 'A';
-  lv_textarea_add_char(s_activeTa, ch);
-  s_t9LastBtnIdx = idx;
-  s_t9LastPressMs = now;
 }
 
 static void onSkip(lv_event_t *e) {
@@ -615,74 +547,52 @@ static void createSetupScreen() {
   lv_obj_set_style_text_color(s_pwStatusLabel, lv_color_hex(0xffffff), 0);
   lv_obj_align(s_pwStatusLabel, LV_ALIGN_TOP_MID, 0, 80);
 
-  // Right column is 3 stacked buttons now (was 2, ~99px each) to fit the
-  // WiFi/Server tab switch alongside Symbols/Back - 64px each still clears
-  // design.md's 48px touch-target minimum with room to spare.
-  const int32_t PW_BTN_W = 70, PW_BTN_H = 64, PW_BTN_GAP = 4;
-  const int32_t PW_COL_X = -10;
-  int32_t pwBtnY = 113;
-
-  s_pwSymbolsBtn = lv_btn_create(lv_scr_act());
-  lv_obj_set_size(s_pwSymbolsBtn, PW_BTN_W, PW_BTN_H);
-  lv_obj_align(s_pwSymbolsBtn, LV_ALIGN_TOP_RIGHT, PW_COL_X, pwBtnY);
-  lv_obj_add_event_cb(s_pwSymbolsBtn, onSymbolsBtn, LV_EVENT_CLICKED, NULL);
-  lv_obj_set_style_radius(s_pwSymbolsBtn, 16, 0);
-  lv_obj_set_style_bg_color(s_pwSymbolsBtn, lv_color_hex(0x1e293b), 0);
-  lv_obj_set_style_border_width(s_pwSymbolsBtn, 1, 0);
-  lv_obj_set_style_border_color(s_pwSymbolsBtn, lv_color_hex(0x22c55e), 0);
-  lv_obj_t *symbolsLabel = lv_label_create(s_pwSymbolsBtn);
-  lv_label_set_text(symbolsLabel, "@#$\n%^&*");
-  lv_obj_set_style_text_align(symbolsLabel, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_center(symbolsLabel);
-  pwBtnY += PW_BTN_H + PW_BTN_GAP;
-
-  s_pwBackBtn = lv_btn_create(lv_scr_act());
-  lv_obj_set_size(s_pwBackBtn, PW_BTN_W, PW_BTN_H);
-  lv_obj_align(s_pwBackBtn, LV_ALIGN_TOP_RIGHT, PW_COL_X, pwBtnY);
-  lv_obj_add_event_cb(s_pwBackBtn, onBackToList, LV_EVENT_CLICKED, NULL);
-  lv_obj_set_style_radius(s_pwBackBtn, 16, 0);
-  lv_obj_set_style_bg_color(s_pwBackBtn, lv_color_hex(0x1e293b), 0);
-  lv_obj_set_style_border_width(s_pwBackBtn, 1, 0);
-  lv_obj_set_style_border_color(s_pwBackBtn, lv_color_hex(0x22c55e), 0);
-  lv_obj_t *backLabel = lv_label_create(s_pwBackBtn);
-  lv_label_set_text(backLabel, LV_SYMBOL_LEFT "\nBack");
-  lv_obj_set_style_text_align(backLabel, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_center(backLabel);
-  pwBtnY += PW_BTN_H + PW_BTN_GAP;
-
-  // Toggles between the WiFi password and Server IP fields - see
-  // onTabToggle(), which rewrites this button's own label to name whichever
-  // tab tapping it switches TO.
+  // Single small button now (was a 3-stacked column: Symbols/Back/Tab) -
+  // lv_keyboard's own OK/keyboard-glyph keys cover Send and Back (see
+  // onPwKeyboardEvent()), and its own "1#"/"ABC" keys cover symbols/shift,
+  // so only the WiFi<->Server tab switch still needs a dedicated widget.
+  // Freeing that column's width is the actual point of this experiment -
+  // bigger QWERTY keys, not just fitting one more button.
+  const int32_t PW_BTN_W = 70, PW_BTN_H = 36;
   s_tabBtn = lv_btn_create(lv_scr_act());
   lv_obj_set_size(s_tabBtn, PW_BTN_W, PW_BTN_H);
-  lv_obj_align(s_tabBtn, LV_ALIGN_TOP_RIGHT, PW_COL_X, pwBtnY);
+  lv_obj_align(s_tabBtn, LV_ALIGN_TOP_RIGHT, -10, 113);
   lv_obj_add_event_cb(s_tabBtn, onTabToggle, LV_EVENT_CLICKED, NULL);
-  lv_obj_set_style_radius(s_tabBtn, 16, 0);
+  lv_obj_set_style_radius(s_tabBtn, 12, 0);
   lv_obj_set_style_bg_color(s_tabBtn, lv_color_hex(0x1e293b), 0);
   lv_obj_set_style_border_width(s_tabBtn, 1, 0);
   lv_obj_set_style_border_color(s_tabBtn, lv_color_hex(0x22c55e), 0);
   lv_obj_t *tabLabel = lv_label_create(s_tabBtn);
   lv_label_set_text(tabLabel, "Server\n" LV_SYMBOL_RIGHT);
+  lv_obj_set_style_text_font(tabLabel, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_align(tabLabel, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_center(tabLabel);
 
-  s_pwKb = lv_btnmatrix_create(lv_scr_act());
-  lv_btnmatrix_set_map(s_pwKb, wifiT9MapLower);
-  lv_obj_add_event_cb(s_pwKb, onPwKeypad, LV_EVENT_VALUE_CHANGED, NULL);
+  // QWERTY keyboard - nearly full content width (460 of 480) for bigger
+  // keys than the old T9 grid's 380px had room for, starting right below
+  // the tab button's row (both start at the same y=113 dead-zone-safe
+  // line - see the CONTENT_W/MARGIN/GAP comment convention this firmware
+  // otherwise uses in main.cpp). lv_keyboard_set_textarea() (called from
+  // applyTabVisibility()) is what actually routes keystrokes - this
+  // create call just builds the widget and styles it to match the rest of
+  // the dark/green theme.
+  s_pwKb = lv_keyboard_create(lv_scr_act());
+  lv_obj_add_event_cb(s_pwKb, onPwKeyboardEvent, LV_EVENT_READY, NULL);
+  lv_obj_add_event_cb(s_pwKb, onPwKeyboardEvent, LV_EVENT_CANCEL, NULL);
   lv_obj_set_style_bg_opa(s_pwKb, LV_OPA_TRANSP, 0);
   lv_obj_set_style_border_width(s_pwKb, 0, 0);
   lv_obj_set_style_pad_all(s_pwKb, 4, 0);
   lv_obj_set_style_pad_row(s_pwKb, 6, 0);
   lv_obj_set_style_pad_column(s_pwKb, 6, 0);
-  lv_obj_set_style_radius(s_pwKb, 10, LV_PART_ITEMS);
+  lv_obj_set_style_radius(s_pwKb, 8, LV_PART_ITEMS);
   lv_obj_set_style_bg_color(s_pwKb, lv_color_hex(0x1e293b), LV_PART_ITEMS);
   lv_obj_set_style_border_width(s_pwKb, 1, LV_PART_ITEMS);
   lv_obj_set_style_border_color(s_pwKb, lv_color_hex(0x22c55e), LV_PART_ITEMS);
   lv_obj_set_style_text_color(s_pwKb, lv_color_hex(0xffffff), LV_PART_ITEMS);
   lv_obj_set_style_bg_color(s_pwKb, lv_color_hex(0x22c55e), LV_PART_ITEMS | LV_STATE_CHECKED);
   lv_obj_set_style_text_color(s_pwKb, lv_color_hex(0x0f172a), LV_PART_ITEMS | LV_STATE_CHECKED);
-  lv_obj_set_size(s_pwKb, 380, 202);
-  lv_obj_align(s_pwKb, LV_ALIGN_TOP_LEFT, 10, 113);
+  lv_obj_set_size(s_pwKb, 460, 160);
+  lv_obj_align(s_pwKb, LV_ALIGN_TOP_LEFT, 10, 155);
 
   showListView(); // start on the list view
 
