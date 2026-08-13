@@ -203,8 +203,9 @@ bool AndonMqtt::submitAndonRequest(const char *categoryCode, const char *reasonC
   return true;
 }
 
-bool AndonMqtt::submitProductionUpdate(int productionCount, const char *workOrderId) {
+bool AndonMqtt::submitProductionUpdate(int productionCount, int rejectCount, const char *workOrderId) {
   String innerPayload = String("\"productionCount\":") + String(productionCount) + "," +
+                         "\"rejectCount\":" + String(rejectCount) + "," +
                          "\"workOrderId\":\"" + workOrderId + "\"";
   return publishEventAndAwaitResult("PRODUCTION_COUNT_UPDATED", innerPayload);
 }

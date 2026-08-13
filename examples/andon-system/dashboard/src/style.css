@@ -64,10 +64,24 @@ section h2 {
   color: var(--text-secondary);
 }
 
+.main-col {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0; /* lets #category-chart's bars shrink instead of overflowing the grid column */
+}
+
 .sidebar {
   display: flex;
   flex-direction: column;
   gap: 20px;
+}
+
+.section-note {
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 400;
+  opacity: 0.7;
 }
 
 #active-board {
@@ -212,6 +226,91 @@ section h2 {
 .empty-state {
   color: var(--text-secondary);
   font-size: 13px;
+}
+
+/* OEE panel - render.ts's renderOeeTiles(). One card per station. */
+#oee-tiles {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.oee-tile {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.oee-station {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+
+.oee-big {
+  font-size: 28px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.oee-unit {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--text-secondary);
+  margin-left: 6px;
+}
+
+.oee-breakdown {
+  display: flex;
+  gap: 12px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Andon-calls-by-category bar chart - render.ts's renderCategoryChart().
+   Plain CSS bars (width % of the track), no charting library. */
+#category-chart {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chart-row {
+  display: grid;
+  grid-template-columns: 90px 1fr 28px;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.chart-label {
+  color: var(--text-secondary);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.chart-bar-track {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  height: 16px;
+  overflow: hidden;
+}
+
+.chart-bar {
+  height: 100%;
+  min-width: 2px; /* stays visible even at count 0 (0% width) is fine to fully collapse, but a >0 count near the axis shouldn't visually vanish */
+  transition: width 0.2s ease-out;
+}
+
+.chart-count {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
 }
 
 /* PLAN.md §4.1 - stacked toasts, top-right, click to dismiss early */

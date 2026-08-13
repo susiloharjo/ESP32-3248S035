@@ -10,7 +10,7 @@ import type { Incident } from "./incident-store";
 export type DashboardEvent =
   | { type: "incident_created"; incident: Incident }
   | { type: "incident_updated"; incident: Incident }
-  | { type: "production_updated"; stationId: string; productionCount: number; workOrderId: string };
+  | { type: "production_updated"; stationId: string; productionCount: number; rejectCount: number; workOrderId: string };
 
 const clients = new Set<WebSocket>();
 

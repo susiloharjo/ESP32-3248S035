@@ -5,6 +5,7 @@
 // there's no need for a diffing layer.
 
 import type { Incident, ProductionEntry } from "./types";
+import type { OeeResult } from "./oee";
 import { CATEGORY_COLORS, STATUS_COLORS } from "./tokens";
 
 function formatAge(openedAt: string): string {
@@ -115,6 +116,62 @@ export function renderProductionTiles(container: HTMLElement, production: Produc
         )
         .join("")
     : `<p class="empty-state">No production data yet.</p>`;
+}
+
+// One card per station, sorted (OeeResult[] already comes pre-sorted by
+// stationId from computeOeeForAllStations()). "(approx)" is repeated on
+// every card, not just the section heading, so it stays visible even if
+// someone screenshots/crops just this panel - see oee.ts's header
+// comment for exactly what's approximated and why.
+export function renderOeeTiles(container: HTMLElement, results: OeeResult[]): void {
+  container.innerHTML = results.length
+    ? results
+        .map((r) => {
+          const pct = (n: number) => Math.round(n * 100);
+          return `
+      <div class="oee-tile">
+        <div class="oee-station">${r.stationId}</div>
+        <div class="oee-big">${pct(r.oee)}<span class="oee-unit">% OEE (approx)</span></div>
+        <div class="oee-breakdown">
+          <span title="Availability">A ${pct(r.availability)}%</span>
+          <span title="Performance">P ${pct(r.performance)}%</span>
+          <span title="Quality">Q ${pct(r.quality)}%</span>
+        </div>
+      </div>`;
+        })
+        .join("")
+    : `<p class="empty-state">No production data yet.</p>`;
+}
+
+// Andon call counts by category ("berapa kali maintenance? quality?
+// dst" - 2026-08-13). Always shows all four known categories (even at
+// 0), not just ones that have happened, so the breakdown reads as a
+// complete picture rather than a list that only grows. Counts every
+// incident ever seen this session (not just active ones) - same
+// since-backend-started scope as everything else in this in-memory demo
+// (agents.md's own scope note: no persistence, resets on restart).
+// Plain CSS bar chart, no charting library - matches PLAN.md §3's "don't
+// need React/etc.'s overhead" call for the rest of this dashboard.
+export function renderCategoryChart(container: HTMLElement, incidents: Incident[]): void {
+  const counts: Record<string, number> = {};
+  for (const i of incidents) counts[i.categoryCode] = (counts[i.categoryCode] ?? 0) + 1;
+
+  const categories = Object.keys(CATEGORY_COLORS);
+  const max = Math.max(1, ...categories.map((c) => counts[c] ?? 0));
+
+  container.innerHTML = categories
+    .map((c) => {
+      const count = counts[c] ?? 0;
+      const pct = Math.round((count / max) * 100);
+      const color = CATEGORY_COLORS[c];
+      return `
+      <div class="chart-row">
+        <span class="chart-label">${c}</span>
+        <div class="chart-bar-track"><div class="chart-bar" style="width:${pct}%;background:${color}"></div></div>
+        <span class="chart-count">${count}</span>
+      </div>`;
+    })
+    .join("");
 }
 
 export function renderConnectionStatus(el: HTMLElement, connected: boolean): void {

@@ -25,7 +25,10 @@ export async function fetchIncidents(): Promise<Incident[]> {
 interface WorkOrderCatalogEntry {
   stationId: string;
   workOrderId: string;
+  product: string;
+  target: number;
   productionCount: number;
+  rejectCount: number;
 }
 
 export async function fetchWorkOrderCatalog(): Promise<ProductionEntry[]> {
@@ -34,7 +37,10 @@ export async function fetchWorkOrderCatalog(): Promise<ProductionEntry[]> {
   return body.workOrders.map((wo) => ({
     stationId: wo.stationId,
     workOrderId: wo.workOrderId,
+    product: wo.product,
+    target: wo.target,
     productionCount: wo.productionCount,
+    rejectCount: wo.rejectCount,
     updatedAt: "", // catalog entry, not a reported event - see render.ts (not used for sorting there)
   }));
 }

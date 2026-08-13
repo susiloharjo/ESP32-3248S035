@@ -37,7 +37,7 @@ import Aedes from "aedes";
 import type { AedesPublishPacket, Client } from "aedes";
 import { STATION_CONFIG } from "./config-data";
 import { createOrGetIncident, listIncidents, acknowledgeIncident, startHandlingIncident, resolveIncident } from "./incident-store";
-import { setProductionCount, listProductionCounts, getProductionCount } from "./production-store";
+import { setProductionCount, listProductionCounts, getProductionCount, getRejectCount } from "./production-store";
 import { listWorkOrders, listAllWorkOrders } from "./work-order-store";
 import { registerClient, broadcast } from "./realtime";
 
@@ -149,9 +149,13 @@ broker.on("publish", (packet: AedesPublishPacket, client: Client | null) => {
     // than routed through the incident store.
     const count = evt.payload.productionCount as number;
     const workOrderId = (evt.payload.workOrderId as string) ?? "";
-    setProductionCount(evt.stationId, count, workOrderId);
-    broadcast({ type: "production_updated", stationId: evt.stationId, productionCount: count, workOrderId });
-    app.log.info({ stationId: evt.stationId, productionCount: count, workOrderId }, "Production count updated");
+    // Optional on the wire (2026-08-13 addition, older firmware won't
+    // send it) - defaults to 0 rather than leaving the field undefined,
+    // see production-store.ts's ProductionEntry.
+    const rejectCount = (evt.payload.rejectCount as number | undefined) ?? 0;
+    setProductionCount(evt.stationId, count, workOrderId, rejectCount);
+    broadcast({ type: "production_updated", stationId: evt.stationId, productionCount: count, rejectCount, workOrderId });
+    app.log.info({ stationId: evt.stationId, productionCount: count, rejectCount, workOrderId }, "Production count updated");
     publishResult(evt.deviceId, evt.correlationId, "n/a");
     return;
   }
@@ -257,6 +261,7 @@ app.get<{ Params: { stationId: string } }>(
     const workOrders = listWorkOrders(stationId).map((wo) => ({
       ...wo,
       productionCount: getProductionCount(stationId, wo.workOrderId),
+      rejectCount: getRejectCount(stationId, wo.workOrderId),
     }));
     return { workOrders };
   },
@@ -273,6 +278,7 @@ app.get("/api/v1/work-orders", async () => {
   const workOrders = listAllWorkOrders().map((wo) => ({
     ...wo,
     productionCount: getProductionCount(wo.stationId, wo.workOrderId),
+    rejectCount: getRejectCount(wo.stationId, wo.workOrderId),
   }));
   return { workOrders };
 });

@@ -54,7 +54,12 @@ bool submitAndonRequest(const char *categoryCode, const char *reasonCode,
 // otherwise an ad-hoc extension both here and in backend/'s handler.
 // Returns true only once the backend actually acks it (same "never claim
 // accepted without proof" rule as submitAndonRequest()).
-bool submitProductionUpdate(int productionCount, const char *workOrderId);
+//
+// rejectCount added 2026-08-13 (OEE Quality tracking - see
+// andon_workorders.hpp's rejectCount()) - reuses this same event/payload
+// rather than a separate one, same "don't invent a new topic for every
+// new field" convention PRODUCTION_COUNT_UPDATED itself already set.
+bool submitProductionUpdate(int productionCount, int rejectCount, const char *workOrderId);
 
 // Device-initiated Start Handling / Resolve - the counterpart to
 // hasStateUpdate()'s incoming Acknowledge push. Deliberately NOT symmetric

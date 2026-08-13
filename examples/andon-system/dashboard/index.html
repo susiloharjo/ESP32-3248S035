@@ -14,15 +14,34 @@
     </header>
 
     <main>
-      <section>
-        <h2>Active incidents</h2>
-        <div id="active-board"></div>
-      </section>
+      <div class="main-col">
+        <section>
+          <h2>Active incidents</h2>
+          <div id="active-board"></div>
+        </section>
+
+        <section>
+          <h2>Andon calls by category</h2>
+          <div id="category-chart"></div>
+        </section>
+      </div>
 
       <div class="sidebar">
         <section>
           <h2>Production</h2>
           <div id="production-tiles"></div>
+        </section>
+
+        <section>
+          <h2>
+            OEE
+            <span
+              class="section-note"
+              title="Simplified estimate, not audit-grade: Availability uses a fixed 8h planned shift and counts every incident as downtime regardless of category; Performance compares actual output to work-order target quantity (no measured ideal cycle time exists in this system); Quality is real (good / (good + reject))."
+              >(approximate, hover for details)</span
+            >
+          </h2>
+          <div id="oee-tiles"></div>
         </section>
 
         <section>

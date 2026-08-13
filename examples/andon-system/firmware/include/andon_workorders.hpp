@@ -76,4 +76,12 @@ int productionCount(int idx);
 // for the next sync().
 void setProductionCount(int idx, int count);
 
+// Reject/defect count - same server-authoritative, sync()-refreshed
+// contract as productionCount() (2026-08-13, added so the dashboard can
+// compute a real OEE Quality figure - good / (good + reject) - instead
+// of assuming 100%). SCR_UPDATE_PRODUCTION's REJECTS row edits this
+// alongside the existing GOOD counter.
+int rejectCount(int idx);
+void setRejectCount(int idx, int count);
+
 } // namespace AndonWorkOrders

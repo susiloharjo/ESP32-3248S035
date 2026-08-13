@@ -633,6 +633,7 @@ struct AndonState {
   uint32_t downtimeSec = 0;  // frozen at resolve time for SCR-06's summary
   bool mockConnected = true; // dev-toggleable fake connectivity (long-press header)
   int productionCount = 72;  // TODO(backend): synced from the line, not operator-owned truth
+  int rejectCount = 0;       // same server-authoritative shape as productionCount - see andon_workorders.hpp
   String incidentId = "";    // backend-assigned - set once AndonMqtt::submitAndonRequest() actually returns ACCEPTED (see submitRequest()); empty while queued/offline
   // Work order the operator is currently producing against - restored/
   // fetched by AndonWorkOrders::sync() in setup(), changeable via
@@ -670,11 +671,14 @@ static lv_timer_t *g_tickTimer = nullptr;
 static lv_obj_t *g_elapsedLabel = nullptr;
 static lv_obj_t *g_waitLabel = nullptr;
 
-// SCR_UPDATE_PRODUCTION's counter - edited value lives here, separate from
-// g_andon.productionCount, so CANCEL can discard it without touching the
-// committed count.
+// SCR_UPDATE_PRODUCTION's counters - edited values live here, separate
+// from g_andon.productionCount/rejectCount, so CANCEL can discard them
+// without touching the committed counts. Reject row added 2026-08-13
+// (OEE Quality tracking - see andon_workorders.hpp's rejectCount()).
 static lv_obj_t *g_productionCounterLabel = nullptr;
 static int g_productionEditValue = 0;
+static lv_obj_t *g_rejectCounterLabel = nullptr;
+static int g_rejectEditValue = 0;
 
 static void showScreenNormal();
 static void showScreenCategory();
@@ -954,6 +958,7 @@ static void clearContent() {
   g_elapsedLabel = nullptr;
   g_waitLabel = nullptr;
   g_productionCounterLabel = nullptr;
+  g_rejectCounterLabel = nullptr;
   lv_obj_clean(g_content);
 }
 
@@ -1130,25 +1135,46 @@ static void onProductionPlus(lv_event_t *e) {
   refreshProductionCounterLabel();
 }
 
-static void onProductionCancel(lv_event_t *e) { showScreenNormal(); } // discards g_productionEditValue
+static void refreshRejectCounterLabel() {
+  if (!g_rejectCounterLabel) return;
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%d", g_rejectEditValue);
+  lv_label_set_text(g_rejectCounterLabel, buf);
+}
+
+static void onRejectMinus(lv_event_t *e) {
+  if (g_rejectEditValue > 0) g_rejectEditValue--;
+  refreshRejectCounterLabel();
+}
+
+static void onRejectPlus(lv_event_t *e) {
+  g_rejectEditValue++;
+  refreshRejectCounterLabel();
+}
+
+static void onProductionCancel(lv_event_t *e) { showScreenNormal(); } // discards g_productionEditValue/g_rejectEditValue
 
 // eventType PRODUCTION_COUNT_UPDATED - see AndonMqtt::submitProductionUpdate()'s
 // comment for why this is an ad-hoc extension, not something architectur.md
-// SS8 specifies. Commits the local count either way (this screen's own
+// SS8 specifies. Commits both local counts either way (this screen's own
 // scratch-value/CANCEL semantics aren't backend-dependent) - only the
 // backend round trip's success/failure is logged, not surfaced to the
 // operator yet (known gap, matches submitRequest()'s "no visual feedback
 // during the blocking wait" note).
 static void onProductionConfirm(lv_event_t *e) {
   g_andon.productionCount = g_productionEditValue;
+  g_andon.rejectCount = g_rejectEditValue;
   // Persist against the selected work order specifically - see
   // onWorkOrderSelect()'s comment for the bug this (together with that
   // function reading it back) fixes.
   int selIdx = AndonWorkOrders::selectedIndex();
-  if (selIdx >= 0) AndonWorkOrders::setProductionCount(selIdx, g_andon.productionCount);
-  bool acked = AndonMqtt::submitProductionUpdate(g_andon.productionCount, g_andon.workOrderId.c_str());
-  Serial.printf("[production] count=%d wo=%s backend_acked=%d\r\n",
-                g_andon.productionCount, g_andon.workOrderId.c_str(), acked);
+  if (selIdx >= 0) {
+    AndonWorkOrders::setProductionCount(selIdx, g_andon.productionCount);
+    AndonWorkOrders::setRejectCount(selIdx, g_andon.rejectCount);
+  }
+  bool acked = AndonMqtt::submitProductionUpdate(g_andon.productionCount, g_andon.rejectCount, g_andon.workOrderId.c_str());
+  Serial.printf("[production] count=%d reject=%d wo=%s backend_acked=%d\r\n",
+                g_andon.productionCount, g_andon.rejectCount, g_andon.workOrderId.c_str(), acked);
   showScreenNormal();
 }
 static void onCategoryCancel(lv_event_t *e) { showScreenNormal(); }
@@ -1210,11 +1236,13 @@ static void cancelRequest() {
   // defaults on every cancel.
   bool wasConnected = g_andon.mockConnected;
   int production = g_andon.productionCount;
+  int reject = g_andon.rejectCount;
   String workOrderId = g_andon.workOrderId;
   int productionTarget = g_andon.productionTarget;
   g_andon = AndonState();
   g_andon.mockConnected = wasConnected;
   g_andon.productionCount = production;
+  g_andon.rejectCount = reject;
   g_andon.workOrderId = workOrderId;
   g_andon.productionTarget = productionTarget;
   showScreenNormal();
@@ -1284,11 +1312,13 @@ static void closeSuccessTimerCb(lv_timer_t *timer) {
 static void onConfirmRun(lv_event_t *e) {
   bool wasConnected = g_andon.mockConnected;
   int production = g_andon.productionCount;
+  int reject = g_andon.rejectCount;
   String workOrderId = g_andon.workOrderId;
   int productionTarget = g_andon.productionTarget;
   g_andon = AndonState();
   g_andon.mockConnected = wasConnected;
   g_andon.productionCount = production;
+  g_andon.rejectCount = reject;
   g_andon.workOrderId = workOrderId;
   g_andon.productionTarget = productionTarget;
 
@@ -1369,6 +1399,12 @@ static void showScreenNormal() {
 // keyboard. Tap = +/-1; hold (LV_EVENT_LONG_PRESSED_REPEAT, built into
 // LVGL's indev - no custom repeat timer needed) auto-repeats for fast
 // adjustment over a larger range.
+//
+// REJECTS row added 2026-08-13 (smaller, below GOOD) so this screen can
+// feed a real OEE Quality figure (good / (good + reject)) on the
+// dashboard instead of assuming 100% - see andon_workorders.hpp's
+// rejectCount(). Deliberately smaller/secondary to GOOD - most taps here
+// are still logging good output, not defects.
 static void showScreenUpdateProduction() {
   clearContent();
 
@@ -1387,7 +1423,13 @@ static void showScreenUpdateProduction() {
   lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
   lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 38);
 
-  const int rowY = 66, rowH = 120, sideW = 100;
+  lv_obj_t *goodCaption = lv_label_create(g_content);
+  lv_label_set_text(goodCaption, "GOOD");
+  lv_obj_set_style_text_color(goodCaption, lv_color_hex(COLOR_RUNNING), 0);
+  lv_obj_set_style_text_font(goodCaption, &lv_font_montserrat_12, 0);
+  lv_obj_align(goodCaption, LV_ALIGN_TOP_LEFT, MARGIN, 52);
+
+  const int rowY = 64, rowH = 82, sideW = 90;
   lv_obj_t *minusBtn = makeButton(g_content, MARGIN, rowY, sideW, rowH, COLOR_BG_RAISED,
                                    LV_SYMBOL_MINUS, &lv_font_montserrat_28, onProductionMinus, nullptr);
   lv_obj_add_event_cb(minusBtn, onProductionMinus, LV_EVENT_LONG_PRESSED_REPEAT, nullptr);
@@ -1405,10 +1447,34 @@ static void showScreenUpdateProduction() {
   lv_obj_set_pos(g_productionCounterLabel, counterX, rowY + (rowH - 56) / 2);
   refreshProductionCounterLabel();
 
+  lv_obj_t *rejectCaption = lv_label_create(g_content);
+  lv_label_set_text(rejectCaption, "REJECTS");
+  lv_obj_set_style_text_color(rejectCaption, lv_color_hex(COLOR_FAULT), 0);
+  lv_obj_set_style_text_font(rejectCaption, &lv_font_montserrat_12, 0);
+  lv_obj_align(rejectCaption, LV_ALIGN_TOP_LEFT, MARGIN, 150);
+
+  const int rejRowY = 162, rejRowH = 44, rejSideW = 60;
+  lv_obj_t *rejMinusBtn = makeButton(g_content, MARGIN, rejRowY, rejSideW, rejRowH, COLOR_BG_RAISED,
+                                      LV_SYMBOL_MINUS, &lv_font_montserrat_18, onRejectMinus, nullptr);
+  lv_obj_add_event_cb(rejMinusBtn, onRejectMinus, LV_EVENT_LONG_PRESSED_REPEAT, nullptr);
+
+  lv_obj_t *rejPlusBtn = makeButton(g_content, CONTENT_W - MARGIN - rejSideW, rejRowY, rejSideW, rejRowH, COLOR_BG_RAISED,
+                                     LV_SYMBOL_PLUS, &lv_font_montserrat_18, onRejectPlus, nullptr);
+  lv_obj_add_event_cb(rejPlusBtn, onRejectPlus, LV_EVENT_LONG_PRESSED_REPEAT, nullptr);
+
+  g_rejectCounterLabel = lv_label_create(g_content);
+  lv_obj_set_style_text_color(g_rejectCounterLabel, lv_color_hex(COLOR_TEXT_PRIMARY), 0);
+  lv_obj_set_style_text_font(g_rejectCounterLabel, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_align(g_rejectCounterLabel, LV_TEXT_ALIGN_CENTER, 0);
+  int rejCounterX = MARGIN + rejSideW + GAP;
+  lv_obj_set_width(g_rejectCounterLabel, CONTENT_W - 2 * (MARGIN + rejSideW + GAP));
+  lv_obj_set_pos(g_rejectCounterLabel, rejCounterX, rejRowY + (rejRowH - 32) / 2);
+  refreshRejectCounterLabel();
+
   int halfW = (CONTENT_W - 2 * MARGIN - GAP) / 2;
-  makeButton(g_content, MARGIN, 210, halfW, 56, COLOR_DISABLED,
+  makeButton(g_content, MARGIN, 214, halfW, 58, COLOR_DISABLED,
              LV_SYMBOL_LEFT "  CANCEL", &lv_font_montserrat_18, onProductionCancel, nullptr);
-  makeButton(g_content, MARGIN + halfW + GAP, 210, halfW, 56, COLOR_RUNNING,
+  makeButton(g_content, MARGIN + halfW + GAP, 214, halfW, 58, COLOR_RUNNING,
              LV_SYMBOL_OK "  CONFIRM", &lv_font_montserrat_18, onProductionConfirm, nullptr);
 }
 
@@ -1496,7 +1562,9 @@ static void onWorkOrderSelect(lv_event_t *e) {
   g_andon.workOrderId = AndonWorkOrders::workOrderId(g_woListCursor);
   g_andon.productionTarget = AndonWorkOrders::target(g_woListCursor);
   g_andon.productionCount = AndonWorkOrders::productionCount(g_woListCursor);
+  g_andon.rejectCount = AndonWorkOrders::rejectCount(g_woListCursor);
   g_productionEditValue = g_andon.productionCount; // edit a scratch copy so CANCEL can discard it
+  g_rejectEditValue = g_andon.rejectCount;
   showScreenUpdateProduction();
 }
 
@@ -1882,6 +1950,7 @@ void setup() {
     // also part of fixing (a boot picking up the wrong/stale global count
     // would be the same symptom one level earlier).
     g_andon.productionCount = AndonWorkOrders::productionCount(idx);
+    g_andon.rejectCount = AndonWorkOrders::rejectCount(idx);
   }
   // SCR-01 already rendered above with the pre-sync placeholder ("WO-240811-07")
   // - rebuild it now that the real work order (fetched or restored) is known.
@@ -1897,9 +1966,9 @@ void setup() {
   // comment above) - best-effort: if the broker's unreachable this just
   // logs and moves on, same as every other sync step here.
   if (WiFi.status() == WL_CONNECTED) {
-    bool acked = AndonMqtt::submitProductionUpdate(g_andon.productionCount, g_andon.workOrderId.c_str());
-    Serial.printf("[boot] production count push count=%d wo=%s backend_acked=%d\r\n",
-                  g_andon.productionCount, g_andon.workOrderId.c_str(), acked);
+    bool acked = AndonMqtt::submitProductionUpdate(g_andon.productionCount, g_andon.rejectCount, g_andon.workOrderId.c_str());
+    Serial.printf("[boot] production count push count=%d reject=%d wo=%s backend_acked=%d\r\n",
+                  g_andon.productionCount, g_andon.rejectCount, g_andon.workOrderId.c_str(), acked);
   } else {
     Serial.println("[boot] no WiFi - skipping boot-time production count push");
   }

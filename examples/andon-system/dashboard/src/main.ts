@@ -2,11 +2,23 @@ import "./style.css";
 import type { Incident, ProductionEntry } from "./types";
 import { fetchIncidents, fetchWorkOrderCatalog, acknowledgeIncident } from "./api";
 import { connectRealtime } from "./realtime";
-import { renderActiveBoard, renderResolvedList, renderProductionTiles, renderConnectionStatus, showAlert, tickAges } from "./render";
+import { computeOeeForAllStations } from "./oee";
+import {
+  renderActiveBoard,
+  renderResolvedList,
+  renderProductionTiles,
+  renderOeeTiles,
+  renderCategoryChart,
+  renderConnectionStatus,
+  showAlert,
+  tickAges,
+} from "./render";
 
 const boardEl = document.querySelector<HTMLElement>("#active-board")!;
 const resolvedEl = document.querySelector<HTMLElement>("#resolved-list")!;
 const productionEl = document.querySelector<HTMLElement>("#production-tiles")!;
+const oeeEl = document.querySelector<HTMLElement>("#oee-tiles")!;
+const categoryChartEl = document.querySelector<HTMLElement>("#category-chart")!;
 const alertsEl = document.querySelector<HTMLElement>("#alerts")!;
 const connectionEl = document.querySelector<HTMLElement>("#connection-status")!;
 
@@ -25,11 +37,18 @@ function productionKey(stationId: string, workOrderId: string): string {
   return `${stationId}::${workOrderId}`;
 }
 
+// OEE (oee.ts) depends on BOTH incidents (Availability, from downtime)
+// and production (Performance/Quality) - renderAll() recomputes it
+// alongside everything else instead of only on one of the two sources,
+// so it stays live whichever changes.
 function renderAll(): void {
-  const list = [...incidents.values()];
-  renderActiveBoard(boardEl, list);
-  renderResolvedList(resolvedEl, list);
-  renderProductionTiles(productionEl, [...production.values()]);
+  const incidentList = [...incidents.values()];
+  const productionList = [...production.values()];
+  renderActiveBoard(boardEl, incidentList);
+  renderResolvedList(resolvedEl, incidentList);
+  renderProductionTiles(productionEl, productionList);
+  renderOeeTiles(oeeEl, computeOeeForAllStations(incidentList, productionList));
+  renderCategoryChart(categoryChartEl, incidentList);
 }
 
 function upsertIncident(incident: Incident): void {
@@ -60,15 +79,25 @@ connectRealtime(
       case "incident_updated":
         upsertIncident(event.incident);
         break;
-      case "production_updated":
+      case "production_updated": {
+        // product/target only ever come from the catalog fetch (see
+        // types.ts's ProductionEntry comment) - preserve whatever was
+        // already known instead of clobbering it with undefined, so
+        // oee.ts's Performance calc (which needs target) doesn't lose
+        // its baseline the moment a live update arrives.
+        const existing = production.get(productionKey(event.stationId, event.workOrderId));
         production.set(productionKey(event.stationId, event.workOrderId), {
           stationId: event.stationId,
           workOrderId: event.workOrderId,
+          product: existing?.product,
+          target: existing?.target,
           productionCount: event.productionCount,
+          rejectCount: event.rejectCount,
           updatedAt: new Date().toISOString(),
         });
-        renderProductionTiles(productionEl, [...production.values()]);
+        renderAll();
         break;
+      }
     }
   },
   (connected) => {

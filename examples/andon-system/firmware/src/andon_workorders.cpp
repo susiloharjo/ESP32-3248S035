@@ -25,6 +25,11 @@ static int s_target[ANDON_WO_MAX];
 // just another field parsed off the same cached/live-fetched JSON as
 // product/target.
 static int s_productionCount[ANDON_WO_MAX];
+// Reject/defect count, same server-authoritative shape as
+// s_productionCount above - added 2026-08-13 so the dashboard can compute
+// a real Quality figure (good / (good + reject)) for OEE instead of
+// assuming 100%. See rejectCount()/setRejectCount().
+static int s_rejectCount[ANDON_WO_MAX];
 static int s_count = 0;
 static int s_selectedIdx = -1;
 
@@ -38,14 +43,15 @@ static void applyPlaceholder() {
   strlcpy(s_product[0], "Unknown product", ANDON_WO_PRODUCT_LEN);
   s_target[0] = 120;
   s_productionCount[0] = 0;
+  s_rejectCount[0] = 0;
   s_count = 1;
 }
 
 // Parses {"workOrders":[{"workOrderId":"...","product":"...","target":N,
-// "productionCount":N}]} into s_id/s_product/s_target/s_productionCount.
-// Returns true if at least one entry was applied (empty/malformed array
-// is not treated as a hard failure - see andon_config.cpp's applyConfig()
-// for the same convention).
+// "productionCount":N,"rejectCount":N}]} into s_id/s_product/s_target/
+// s_productionCount/s_rejectCount. Returns true if at least one entry was
+// applied (empty/malformed array is not treated as a hard failure - see
+// andon_config.cpp's applyConfig() for the same convention).
 static bool applyWorkOrders(JsonDocument &doc) {
   JsonArray arr = doc["workOrders"].as<JsonArray>();
   if (arr.isNull()) {
@@ -65,6 +71,7 @@ static bool applyWorkOrders(JsonDocument &doc) {
     strlcpy(s_product[n], wo["product"] | "", ANDON_WO_PRODUCT_LEN);
     s_target[n] = wo["target"] | 0;
     s_productionCount[n] = wo["productionCount"] | 0; // absent (cached pre-2026-08-13 JSON) -> 0
+    s_rejectCount[n] = wo["rejectCount"] | 0;
     n++;
   }
 
@@ -221,4 +228,15 @@ int AndonWorkOrders::productionCount(int idx) {
 void AndonWorkOrders::setProductionCount(int idx, int count) {
   if (idx < 0 || idx >= s_count) return;
   s_productionCount[idx] = count;
+}
+
+int AndonWorkOrders::rejectCount(int idx) {
+  if (idx < 0 || idx >= s_count) return 0;
+  return s_rejectCount[idx];
+}
+
+// Same in-memory-only contract as setProductionCount() above.
+void AndonWorkOrders::setRejectCount(int idx, int count) {
+  if (idx < 0 || idx >= s_count) return;
+  s_rejectCount[idx] = count;
 }
