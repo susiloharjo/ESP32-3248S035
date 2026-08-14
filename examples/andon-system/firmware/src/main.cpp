@@ -12,6 +12,7 @@
 #include <TFT_eSPI.h>
 #include <WiFi.h> // WiFi.status() - real header connectivity indicator, see updateHeaderConnDot()
 #include <time.h> // struct tm/getLocalTime/strftime - NTP header clock, see tickTimerCb()
+#include <SD.h> // EXPERIMENT (branch experiment/sdcard-test, 2026-08-13) - see testSdCard()
 
 #include "andon_config.hpp" // reason-list sync from the backend - see setup(), andon_config.cpp
 #include "andon_workorders.hpp" // work-order list sync/selection - see setup(), showScreenWorkOrderList()
@@ -1888,6 +1889,107 @@ static void showScreenResolved() {
              LV_SYMBOL_PLAY "  CONFIRM & RUN", &lv_font_montserrat_16, onConfirmRun, nullptr);
 }
 
+// EXPERIMENT (branch experiment/sdcard-test, 2026-08-13) - "saya naruh
+// sdcard di device ini gimana taunya sdcardnya bisa digunakan". Reuses
+// the TF-slot pins confirmed straight off docs/pcb-layout.jpg's own
+// silkscreen labels (TF_CS IO5, MOSI IO23, MISO IO19, CLK IO18 - the
+// ESP32's default VSPI pins) - same pins examples/gemini-chatbot/src/
+// main.cpp's older comment already claimed, and same ones
+// https://randomnerdtutorials.com/esp32-cyd-display-touchscreen-microsd-card/
+// independently confirms for this board family.
+//
+// Attempts 1-2 (see git log) both failed with "Card Failed! cmd: 0x00"
+// despite correct pins, a PC-verified FAT32 card, and 400kHz fallback.
+// Root cause found by reading the VENDOR's own shipped demo
+// (3.5inch_ESP32-3248S035/1-Demo/Demo_Arduino/6_1_SD_Jpg, outside this
+// repo) plus this repo's vendored TFT_eSPI source: on this board the
+// DISPLAY is wired to GPIO 12/13/14/15, and TFT_eSPI (without
+// USE_HSPI_PORT, which our User_Setup.h doesn't define) drives it
+// through `SPIClass& spi = SPI` - i.e. it CLAIMS the global VSPI
+// object and remaps it onto the display's pins (see
+// lib/TFT_eSPI/Processors/TFT_eSPI_ESP32.c:25). So:
+//  - attempt 1's bare SD.begin(TF_CS) used that same global SPI ->
+//    clock/data were going out on the DISPLAY's pins, never on the TF
+//    slot's 18/19/23 -> zero response, cmd 0x00.
+//  - attempt 2's SPIClass(VSPI) was a second handle onto the same
+//    already-claimed peripheral - same fight, same result.
+// The HSPI *peripheral* is what's actually free here (the display only
+// borrowed HSPI's default pin numbers, not the peripheral itself), so
+// the SD gets SPIClass(HSPI) remapped onto the TF slot's real pins.
+#define TF_CS   5
+#define TF_MOSI 23
+#define TF_MISO 19
+#define TF_SCK  18
+static SPIClass g_sdSpi(HSPI);
+
+// 4MHz alone still failed with a card independently confirmed genuine
+// FAT32 (checked by mounting it on a PC directly, bypassing this board
+// entirely) and physically reseated - so this now retries at the SD
+// spec's own minimum/safest init frequency (400kHz) with a settle delay
+// first, in case the card just needs longer to power up than SD.begin()
+// gives it by default.
+//
+// RESOLVED (2026-08-14): with the HSPI approach above AND a different
+// card, this works - SDHC 8GB detected at 4MHz on the first try, full
+// root listing, with the display/LVGL/touch/WiFi/MQTT all still running
+// normally alongside it. The board's TF slot is fine; the ORIGINAL 4GB
+// card was the last problem - it mounts fine in a PC's USB reader but
+// never responds in this slot (old card, likely failing/SPI-mode-
+// incompatible). So: two stacked root causes total - the global-SPI bus
+// conflict (fixed by HSPI, see the comment block above) plus a bad
+// card. The failure message below is now just generic guidance for the
+// next bad card, not a diagnosis of this board.
+static bool trySdBegin(uint32_t freqHz, const char *label) {
+  Serial.printf("[sdtest] SD.begin() at %s...\r\n", label);
+  SD.end(); // undo any previous half-initialized state before retrying
+  bool ok = SD.begin(TF_CS, g_sdSpi, freqHz);
+  Serial.printf("[sdtest]   -> %s\r\n", ok ? "OK" : "failed");
+  return ok;
+}
+
+static void testSdCard() {
+  g_sdSpi.begin(TF_SCK, TF_MISO, TF_MOSI, TF_CS);
+  delay(250); // let the card's power rail settle before the first command
+
+  bool began = trySdBegin(4000000, "4MHz");
+  if (!began) began = trySdBegin(400000, "400kHz (SD spec's own init-phase minimum)");
+
+  if (!began) {
+    Serial.println("[sdtest] FAILED at both speeds - the init approach here is known-good on"
+                    " this board (verified 2026-08-14 with an SDHC card), so suspect the CARD:"
+                    " try another one, check seating/format (FAT32).");
+    return;
+  }
+
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("[sdtest] SD.begin() succeeded but cardType() == CARD_NONE - no card physically present");
+    return;
+  }
+  const char *typeName = cardType == CARD_MMC    ? "MMC"
+                        : cardType == CARD_SD    ? "SDSC"
+                        : cardType == CARD_SDHC  ? "SDHC/SDXC"
+                        : "UNKNOWN";
+  uint64_t sizeMB = SD.cardSize() / (1024 * 1024);
+  Serial.printf("[sdtest] Card detected: type=%s size=%lluMB\r\n", typeName, sizeMB);
+
+  Serial.println("[sdtest] Root directory listing:");
+  File root = SD.open("/");
+  if (!root || !root.isDirectory()) {
+    Serial.println("[sdtest]   (couldn't open / as a directory - card may be corrupt/unformatted)");
+    return;
+  }
+  int fileCount = 0;
+  File entry = root.openNextFile();
+  while (entry) {
+    Serial.printf("[sdtest]   %s%s  (%d bytes)\r\n", entry.isDirectory() ? "[DIR] " : "", entry.name(), entry.size());
+    fileCount++;
+    entry = root.openNextFile();
+  }
+  if (fileCount == 0) Serial.println("[sdtest]   (empty)");
+  Serial.println("[sdtest] Done - SD card is usable.");
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("Starting ESP32-3248S035 Andon System...");
@@ -1902,6 +2004,8 @@ void setup() {
   tft.begin();
   tft.setRotation(1); // landscape
   tft.fillScreen(TFT_BLACK);
+
+  testSdCard(); // EXPERIMENT (branch experiment/sdcard-test) - Serial-only, see its own comment
 
   lv_disp_draw_buf_init(&draw_buf, buf, NULL, screenWidth * 10);
 
