@@ -19,13 +19,23 @@
 // (see that package's own scope note), NOT the full agents.md §9 firmware
 // reliability story:
 //  - One synchronous attempt per tap: connect, publish QoS 1, wait
-//    (bounded) for the COMMAND_RESULT. No persisted offline queue, no
-//    retry-with-backoff, no idempotency key surviving a reboot (agents.md
-//    §9 requires all of these for production - "Retain the same
-//    idempotency key across retries and reboot", "bounded exponential
-//    backoff with jitter"). A failed/timed-out attempt currently just
-//    reports failure - main.cpp's SCR-04B QueuedOffline path isn't wired
-//    to this yet.
+//    (bounded) for the COMMAND_RESULT. Still no retry-with-backoff (a
+//    failed attempt gets ONE retry per AndonMqtt::poll() tick, throttled
+//    to roughly once every 8s - not the "bounded exponential backoff with
+//    jitter" agents.md §9 asks for). A failed/timed-out attempt currently
+//    just reports failure to the caller (main.cpp's SCR-04B QueuedOffline
+//    path isn't wired to reflect a queued retry in the UI yet) - but see
+//    below, it's no longer silently dropped either.
+//  - **Persisted offline queue + idempotency-across-reboot: DONE
+//    (2026-08-14)**, for submitAndonRequest()/submitProductionUpdate()
+//    only (not submitStatusUpdate() - see that function's own comment).
+//    A delivery failure (no WiFi, broker unreachable, or a COMMAND_RESULT
+//    timeout - NOT an explicit REJECTED result, which is a definitive
+//    answer, not a delivery failure) hands the exact already-built
+//    envelope to AndonOfflineQueue::enqueue() (see andon_offlinequeue.hpp),
+//    SD-persisted so it survives a reboot with its original
+//    idempotencyKey/eventId/correlationId intact, then automatically
+//    retried by AndonMqtt::poll() once connectivity returns.
 //  - No TLS, no device credentials/ACLs (agents.md §12) - matches
 //    backend/'s own local-test-only scope for now.
 namespace AndonMqtt {
@@ -41,6 +51,8 @@ namespace AndonMqtt {
 // same as andon_wifi.cpp's tryConnectWifi() - does not call
 // lv_timer_handler() itself, so it isn't the reentrancy hazard
 // AndonWifi::runSetupFlow() is - see that header's comment).
+// A delivery failure (not an explicit reject) gets queued for automatic
+// retry - see this file's SCOPE note and andon_offlinequeue.hpp.
 bool submitAndonRequest(const char *categoryCode, const char *reasonCode,
                          const char *workOrderId, String &outIncidentId);
 

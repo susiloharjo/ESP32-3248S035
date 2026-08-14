@@ -1,5 +1,6 @@
 #include "andon_mqtt.hpp"
 #include "andon_wifi.hpp"
+#include "andon_offlinequeue.hpp" // persisted retry queue - see publishEventAndAwaitResult()/flushOfflineQueue()
 
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -127,13 +128,22 @@ static bool ensureConnected() {
 // once an ACCEPTED result actually comes back - see andon_mqtt.hpp's
 // header comment for why that distinction matters (agents.md: never claim
 // backend-accepted without proof).
-static bool publishEventAndAwaitResult(const char *eventType, const String &innerPayloadJson) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("AndonMqtt: no WiFi - can't submit");
-    return false;
-  }
-  if (!ensureConnected()) return false;
-
+//
+// queueOnFailure (2026-08-14): when true, every "never got a definitive
+// answer" exit point below (no WiFi, broker unreachable, publish()
+// failing, or a COMMAND_RESULT timeout) hands the exact envelope/topic
+// just built to AndonOfflineQueue::enqueue() for later automatic retry
+// instead of just dropping it - see that module's header comment.
+// Deliberately NOT triggered by an explicit REJECTED result (the very
+// last line below) - that's a definitive backend answer, not a delivery
+// failure, and retrying it would be pointless. Callers that shouldn't
+// queue (submitStatusUpdate() - device-only Start Handling/Resolve,
+// out of scope for this pass, see AndonOfflineQueue's header) pass false.
+static bool publishEventAndAwaitResult(const char *eventType, const String &innerPayloadJson,
+                                        bool queueOnFailure) {
+  // Built up front so every early-return below can still enqueue it -
+  // only WiFi/AndonWifi state is needed before this point, no network
+  // round trip has to have happened yet.
   static uint32_t sequence = 0;
   sequence++;
   String eventId = deviceId() + "-evt-" + String(millis()) + "-" + String(sequence);
@@ -164,6 +174,16 @@ static bool publishEventAndAwaitResult(const char *eventType, const String &inne
   String eventTopic = "andon/v1/plant/" + String(PLANT_ID) + "/station/" + String(STATION_ID) +
                        "/device/" + deviceId() + "/event";
 
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("AndonMqtt: no WiFi - can't submit");
+    if (queueOnFailure) AndonOfflineQueue::enqueue(eventTopic, payload);
+    return false;
+  }
+  if (!ensureConnected()) {
+    if (queueOnFailure) AndonOfflineQueue::enqueue(eventTopic, payload);
+    return false;
+  }
+
   // architectur.md SS8.3 asks for QoS 1 - PubSubClient (this library) has
   // no PUBACK handling and always sends QoS 0 on the wire regardless of
   // what's requested. Acceptable for this local test harness (see
@@ -174,6 +194,7 @@ static bool publishEventAndAwaitResult(const char *eventType, const String &inne
   Serial.printf("AndonMqtt: publishing %s to %s\r\n", eventType, eventTopic.c_str());
   if (!s_mqtt.publish(eventTopic.c_str(), payload.c_str())) {
     Serial.println("AndonMqtt: publish failed");
+    if (queueOnFailure) AndonOfflineQueue::enqueue(eventTopic, payload);
     return false;
   }
 
@@ -185,12 +206,13 @@ static bool publishEventAndAwaitResult(const char *eventType, const String &inne
 
   if (!s_resultReceived) {
     Serial.println("AndonMqtt: timed out waiting for COMMAND_RESULT");
+    if (queueOnFailure) AndonOfflineQueue::enqueue(eventTopic, payload);
     return false;
   }
 
   Serial.printf("AndonMqtt: result status=%s incidentId=%s\r\n",
                 s_resultStatus.c_str(), s_resultIncidentId.c_str());
-  return s_resultStatus == "ACCEPTED";
+  return s_resultStatus == "ACCEPTED"; // REJECTED falls through here too - a definitive answer, never queued
 }
 
 bool AndonMqtt::submitAndonRequest(const char *categoryCode, const char *reasonCode,
@@ -198,7 +220,12 @@ bool AndonMqtt::submitAndonRequest(const char *categoryCode, const char *reasonC
   String innerPayload = String("\"categoryCode\":\"") + categoryCode + "\"," +
                          "\"reasonCode\":\"" + reasonCode + "\"," +
                          "\"workOrderId\":\"" + workOrderId + "\"";
-  if (!publishEventAndAwaitResult("ANDON_REQUESTED", innerPayload)) return false;
+  // queueOnFailure=true - see publishEventAndAwaitResult()'s comment.
+  // outIncidentId stays empty on a queued (not-yet-delivered) request;
+  // the caller (main.cpp's submitRequest()) already treats "not accepted"
+  // as SCR-04B QueuedOffline regardless of the reason, so this doesn't
+  // need its own signal for "queued vs. genuinely failed" yet.
+  if (!publishEventAndAwaitResult("ANDON_REQUESTED", innerPayload, true)) return false;
   outIncidentId = s_resultIncidentId;
   return true;
 }
@@ -207,13 +234,63 @@ bool AndonMqtt::submitProductionUpdate(int productionCount, int rejectCount, con
   String innerPayload = String("\"productionCount\":") + String(productionCount) + "," +
                          "\"rejectCount\":" + String(rejectCount) + "," +
                          "\"workOrderId\":\"" + workOrderId + "\"";
-  return publishEventAndAwaitResult("PRODUCTION_COUNT_UPDATED", innerPayload);
+  return publishEventAndAwaitResult("PRODUCTION_COUNT_UPDATED", innerPayload, true);
 }
 
 bool AndonMqtt::submitStatusUpdate(const char *incidentId, const char *status) {
+  // queueOnFailure=false, deliberately - see AndonOfflineQueue's header
+  // comment and publishEventAndAwaitResult()'s: Start Handling/Resolve
+  // are device-only by product decision (a technician must be physically
+  // at the terminal), out of scope for automatic offline retry in this
+  // pass.
   String innerPayload = String("\"incidentId\":\"") + incidentId + "\"," +
                          "\"status\":\"" + status + "\"";
-  return publishEventAndAwaitResult("INCIDENT_STATUS_UPDATE", innerPayload);
+  return publishEventAndAwaitResult("INCIDENT_STATUS_UPDATE", innerPayload, false);
+}
+
+// Resends the oldest queued entry (AndonOfflineQueue) over the already-
+// connected s_mqtt - caller (poll(), below) guarantees connectivity
+// before calling this. Only ever handles ONE entry per call (not a
+// while-loop draining the whole queue) so a long queue can't block
+// poll()/loop() for multiple round trips in a row; the next poll() tick
+// picks up wherever this left off. Stops (leaves the entry queued) on
+// anything short of a definitive COMMAND_RESULT, same "never claim
+// accepted without proof, preserve delivery order" logic
+// publishEventAndAwaitResult() itself uses - an ACCEPTED *or* REJECTED
+// result both count as definitive here too (see that function's own
+// comment on why REJECTED shouldn't cause requeueing).
+static void flushOfflineQueueOnce() {
+  String topic, payload;
+  if (!AndonOfflineQueue::peekFront(topic, payload)) return;
+
+  String correlationId;
+  if (!extractField(payload, "correlationId", correlationId)) {
+    Serial.println("AndonOfflineQueue: queued entry has no correlationId - dropping corrupt entry");
+    AndonOfflineQueue::removeFront();
+    return;
+  }
+
+  Serial.printf("AndonOfflineQueue: retrying queued publish to %s\r\n", topic.c_str());
+  s_resultReceived = false;
+  s_waitingCorrelationId = correlationId;
+  if (!s_mqtt.publish(topic.c_str(), payload.c_str())) {
+    Serial.println("AndonOfflineQueue: publish() failed again - will retry next poll()");
+    return; // leave it queued, try again later
+  }
+
+  uint32_t start = millis();
+  while (!s_resultReceived && millis() - start < 5000) {
+    s_mqtt.loop();
+    delay(20);
+  }
+  if (!s_resultReceived) {
+    Serial.println("AndonOfflineQueue: timed out again - will retry next poll()");
+    return; // leave it queued
+  }
+
+  Serial.printf("AndonOfflineQueue: queued entry resolved, result=%s - removing from queue\r\n",
+                s_resultStatus.c_str());
+  AndonOfflineQueue::removeFront();
 }
 
 void AndonMqtt::poll() {
@@ -231,6 +308,26 @@ void AndonMqtt::poll() {
   }
 
   s_mqtt.loop();
+
+  // Own throttle, separate from the reconnect one above - only bother
+  // once actually connected, and no more than once every few seconds
+  // even then (each attempt can block up to ~5s waiting for a result, so
+  // this also caps how often loop() can stall for that long).
+  //
+  // The time check MUST short-circuit before AndonOfflineQueue::count()
+  // runs, not after - count() does real SD I/O (opens the queue file),
+  // and with an empty/nonexistent queue that's a failed open() every
+  // single time. Originally written the other way around (count() first)
+  // - on real hardware that meant an SD.open() attempt on every loop()
+  // tick (~every 50ms) whenever MQTT was connected, logging a
+  // "does not exist" error from the ESP-IDF VFS layer each time -
+  // harmless to correctness but needless SD thrashing and log spam.
+  static uint32_t lastFlushAttemptMs = 0;
+  uint32_t now = millis();
+  if (s_mqtt.connected() && now - lastFlushAttemptMs > 8000) {
+    lastFlushAttemptMs = now;
+    if (AndonOfflineQueue::count() > 0) flushOfflineQueueOnce();
+  }
 }
 
 bool AndonMqtt::hasStateUpdate() {

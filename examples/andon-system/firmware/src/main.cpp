@@ -12,12 +12,13 @@
 #include <TFT_eSPI.h>
 #include <WiFi.h> // WiFi.status() - real header connectivity indicator, see updateHeaderConnDot()
 #include <time.h> // struct tm/getLocalTime/strftime - NTP header clock, see tickTimerCb()
-#include <SD.h> // EXPERIMENT (branch experiment/sdcard-test, 2026-08-13) - see testSdCard()
+#include <SD.h> // microSD (TF slot) - see setup(), testSdCard()
 
 #include "andon_config.hpp" // reason-list sync from the backend - see setup(), andon_config.cpp
 #include "andon_workorders.hpp" // work-order list sync/selection - see setup(), showScreenWorkOrderList()
 #include "andon_wifi.hpp" // on-device WiFi setup screen - see onOpenConfig(), loop()
 #include "andon_mqtt.hpp" // Send Request submission - see submitRequest()
+#include "andon_offlinequeue.hpp" // SD-backed retry queue - see setup(), AndonMqtt::poll()
 
 //------------------------------------------------------------------------------
 // GT911 touch controller - bit-banged I2C driver
@@ -1889,9 +1890,11 @@ static void showScreenResolved() {
              LV_SYMBOL_PLAY "  CONFIRM & RUN", &lv_font_montserrat_16, onConfirmRun, nullptr);
 }
 
-// EXPERIMENT (branch experiment/sdcard-test, 2026-08-13) - "saya naruh
-// sdcard di device ini gimana taunya sdcardnya bisa digunakan". Reuses
-// the TF-slot pins confirmed straight off docs/pcb-layout.jpg's own
+// microSD (TF slot) diagnostic - added 2026-08-13 ("saya naruh sdcard di
+// device ini gimana taunya sdcardnya bisa digunakan"), confirmed working
+// and merged into main 2026-08-14 (was branch experiment/sdcard-test -
+// see its git log for the full debugging trail this comment summarizes).
+// Reuses the TF-slot pins confirmed straight off docs/pcb-layout.jpg's own
 // silkscreen labels (TF_CS IO5, MOSI IO23, MISO IO19, CLK IO18 - the
 // ESP32's default VSPI pins) - same pins examples/gemini-chatbot/src/
 // main.cpp's older comment already claimed, and same ones
@@ -1947,7 +1950,11 @@ static bool trySdBegin(uint32_t freqHz, const char *label) {
   return ok;
 }
 
-static void testSdCard() {
+// Returns true if the card is usable (SD.begin() succeeded) - main.cpp's
+// setup() feeds this straight into AndonOfflineQueue::begin(), the first
+// real feature built on top of this diagnostic (see that module for what
+// it uses the now-mounted SD filesystem for).
+static bool testSdCard() {
   g_sdSpi.begin(TF_SCK, TF_MISO, TF_MOSI, TF_CS);
   delay(250); // let the card's power rail settle before the first command
 
@@ -1958,13 +1965,13 @@ static void testSdCard() {
     Serial.println("[sdtest] FAILED at both speeds - the init approach here is known-good on"
                     " this board (verified 2026-08-14 with an SDHC card), so suspect the CARD:"
                     " try another one, check seating/format (FAT32).");
-    return;
+    return false;
   }
 
   uint8_t cardType = SD.cardType();
   if (cardType == CARD_NONE) {
     Serial.println("[sdtest] SD.begin() succeeded but cardType() == CARD_NONE - no card physically present");
-    return;
+    return false;
   }
   const char *typeName = cardType == CARD_MMC    ? "MMC"
                         : cardType == CARD_SD    ? "SDSC"
@@ -1977,7 +1984,7 @@ static void testSdCard() {
   File root = SD.open("/");
   if (!root || !root.isDirectory()) {
     Serial.println("[sdtest]   (couldn't open / as a directory - card may be corrupt/unformatted)");
-    return;
+    return false;
   }
   int fileCount = 0;
   File entry = root.openNextFile();
@@ -1988,6 +1995,7 @@ static void testSdCard() {
   }
   if (fileCount == 0) Serial.println("[sdtest]   (empty)");
   Serial.println("[sdtest] Done - SD card is usable.");
+  return true;
 }
 
 void setup() {
@@ -2005,7 +2013,11 @@ void setup() {
   tft.setRotation(1); // landscape
   tft.fillScreen(TFT_BLACK);
 
-  testSdCard(); // EXPERIMENT (branch experiment/sdcard-test) - Serial-only, see its own comment
+  // Serial-only diagnostic (see testSdCard()'s own comment) - its return
+  // value is what actually matters going forward: AndonOfflineQueue reads
+  // it to know whether SD-backed retry queueing is available this boot.
+  bool sdReady = testSdCard();
+  AndonOfflineQueue::begin(sdReady);
 
   lv_disp_draw_buf_init(&draw_buf, buf, NULL, screenWidth * 10);
 
