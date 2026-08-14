@@ -1927,10 +1927,18 @@ static SPIClass g_sdSpi(HSPI);
 // entirely) and physically reseated - so this now retries at the SD
 // spec's own minimum/safest init frequency (400kHz) with a settle delay
 // first, in case the card just needs longer to power up than SD.begin()
-// gives it by default. If this ALSO fails, the remaining explanations
-// are hardware (bad solder joint on the TF connector, worn/misaligned
-// contacts, or missing pull-ups on this board's TF lines), not firmware -
-// there's nothing left on the software side to try.
+// gives it by default.
+//
+// RESOLVED (2026-08-14): with the HSPI approach above AND a different
+// card, this works - SDHC 8GB detected at 4MHz on the first try, full
+// root listing, with the display/LVGL/touch/WiFi/MQTT all still running
+// normally alongside it. The board's TF slot is fine; the ORIGINAL 4GB
+// card was the last problem - it mounts fine in a PC's USB reader but
+// never responds in this slot (old card, likely failing/SPI-mode-
+// incompatible). So: two stacked root causes total - the global-SPI bus
+// conflict (fixed by HSPI, see the comment block above) plus a bad
+// card. The failure message below is now just generic guidance for the
+// next bad card, not a diagnosis of this board.
 static bool trySdBegin(uint32_t freqHz, const char *label) {
   Serial.printf("[sdtest] SD.begin() at %s...\r\n", label);
   SD.end(); // undo any previous half-initialized state before retrying
@@ -1947,10 +1955,9 @@ static void testSdCard() {
   if (!began) began = trySdBegin(400000, "400kHz (SD spec's own init-phase minimum)");
 
   if (!began) {
-    Serial.println("[sdtest] FAILED at both speeds - pins/init/format/physical seating are all"
-                    " already confirmed correct, so this points to a hardware fault on the TF"
-                    " slot itself (bad solder joint, worn contacts, or missing pull-ups), not"
-                    " firmware.");
+    Serial.println("[sdtest] FAILED at both speeds - the init approach here is known-good on"
+                    " this board (verified 2026-08-14 with an SDHC card), so suspect the CARD:"
+                    " try another one, check seating/format (FAT32).");
     return;
   }
 
