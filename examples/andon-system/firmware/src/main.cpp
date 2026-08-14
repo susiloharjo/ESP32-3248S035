@@ -1898,22 +1898,29 @@ static void showScreenResolved() {
 // https://randomnerdtutorials.com/esp32-cyd-display-touchscreen-microsd-card/
 // independently confirms for this board family.
 //
-// First cut of this test (see git log) called bare SD.begin(TF_CS),
-// assuming TFT_eSPI's tft.begin() already left the VSPI bus in a state
-// the SD library could just piggyback on - that produced "Card Failed!
-// cmd: 0x00" (fails before the filesystem layer even engages) even with
-// a freshly-formatted card physically inserted. The tutorial above does
-// it differently: an explicit, separate SPIClass(VSPI) instance,
-// .begin()'d with the exact pins, handed to SD.begin() instead of
-// relying on whatever TFT_eSPI already set up - that's what this does
-// now. (The tutorial's touch/SD VSPI-conflict warning doesn't apply
-// here - this firmware's touch driver is bit-banged I2C (gt911_init()),
-// not SPI, so only the display and SD actually share this bus.)
+// Attempts 1-2 (see git log) both failed with "Card Failed! cmd: 0x00"
+// despite correct pins, a PC-verified FAT32 card, and 400kHz fallback.
+// Root cause found by reading the VENDOR's own shipped demo
+// (3.5inch_ESP32-3248S035/1-Demo/Demo_Arduino/6_1_SD_Jpg, outside this
+// repo) plus this repo's vendored TFT_eSPI source: on this board the
+// DISPLAY is wired to GPIO 12/13/14/15, and TFT_eSPI (without
+// USE_HSPI_PORT, which our User_Setup.h doesn't define) drives it
+// through `SPIClass& spi = SPI` - i.e. it CLAIMS the global VSPI
+// object and remaps it onto the display's pins (see
+// lib/TFT_eSPI/Processors/TFT_eSPI_ESP32.c:25). So:
+//  - attempt 1's bare SD.begin(TF_CS) used that same global SPI ->
+//    clock/data were going out on the DISPLAY's pins, never on the TF
+//    slot's 18/19/23 -> zero response, cmd 0x00.
+//  - attempt 2's SPIClass(VSPI) was a second handle onto the same
+//    already-claimed peripheral - same fight, same result.
+// The HSPI *peripheral* is what's actually free here (the display only
+// borrowed HSPI's default pin numbers, not the peripheral itself), so
+// the SD gets SPIClass(HSPI) remapped onto the TF slot's real pins.
 #define TF_CS   5
 #define TF_MOSI 23
 #define TF_MISO 19
 #define TF_SCK  18
-static SPIClass g_sdSpi(VSPI);
+static SPIClass g_sdSpi(HSPI);
 
 // 4MHz alone still failed with a card independently confirmed genuine
 // FAT32 (checked by mounting it on a PC directly, bypassing this board
